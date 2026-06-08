@@ -399,21 +399,131 @@ async function ensureCvReady(timeoutMs = 8000) {
   });
 }
 
-/* ---------- Camera ---------- */
+/* ---------- Camera ----------
+   Goal: pick the best back lens available and capture at the highest
+   resolution/quality the device exposes. */
+
+// Cache of devices and the chosen environment-facing device.
+state.videoTrack = null;
+state.imageCapture = null;
+state.chosenDeviceId = null;
+
+// Pick the "best" environment-facing camera. Many phones expose 3 back
+// cameras (ultra-wide, wide/main, telephoto). The main lens is almost
+// always the one whose capabilities advertise the highest resolution and
+// whose label does NOT mention "ultra"/"telephoto"/"depth"/"mono".
+async function chooseBestEnvironmentDevice() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return null;
+  let devs;
+  try { devs = await navigator.mediaDevices.enumerateDevices(); }
+  catch (_) { return null; }
+  const cams = devs.filter(d => d.kind === 'videoinput');
+  if (cams.length === 0) return null;
+
+  const wantFront = state.facing === 'user';
+  const labelIsFront = (s) => /front|user|self|셀카|전면/i.test(s);
+  const labelIsBad = (s) => /ultra|wide.?angle|tele|zoom|depth|mono|ir\b|infrared/i.test(s);
+  // Prefer ones explicitly tagged for the requested side.
+  const sideMatch = cams.filter(d => {
+    const l = d.label || '';
+    return wantFront ? labelIsFront(l) : (/back|rear|environment|후면/i.test(l) || !labelIsFront(l));
+  });
+  const pool = sideMatch.length ? sideMatch : cams;
+
+  // Score by max reported resolution from getCapabilities() if available,
+  // penalizing "bad" lenses we want to avoid.
+  let best = null, bestScore = -1;
+  for (const d of pool) {
+    let score = 0;
+    try {
+      // getCapabilities is only on tracks, but InputDeviceInfo.getCapabilities
+      // is supported on Chrome desktop/Android. Fall back to label heuristics.
+      if (typeof d.getCapabilities === 'function') {
+        const caps = d.getCapabilities();
+        const w = (caps.width && caps.width.max) || 0;
+        const h = (caps.height && caps.height.max) || 0;
+        score = w * h;
+      }
+    } catch (_) {}
+    if (labelIsBad(d.label || '')) score = Math.max(0, score) - 1e9;
+    // Tiny bonus for devices whose label suggests "main" / "wide" (the
+    // primary lens on iOS is often unlabeled; Android often labels it 0).
+    if (/main|primary|기본/i.test(d.label || '')) score += 1e8;
+    if (score > bestScore) { bestScore = score; best = d; }
+  }
+  return best ? best.deviceId : null;
+}
+
 async function startCamera() {
   stopCamera();
-  try {
-    state.stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: state.facing, width: { ideal: 1920 }, height: { ideal: 1080 } },
-      audio: false
-    });
+  // We always want the highest fidelity preview the device will give us,
+  // so we ask for an effectively-uncapped resolution (browsers cap to the
+  // device's native max).
+  const baseVideo = {
+    width:  { ideal: 4096 },
+    height: { ideal: 2160 },
+    frameRate: { ideal: 30 },
+  };
+
+  async function open(constraints) {
+    state.stream = await navigator.mediaDevices.getUserMedia({ video: constraints, audio: false });
     $('video').srcObject = state.stream;
+    state.videoTrack = state.stream.getVideoTracks()[0] || null;
+    // Push track to its max resolution if applyConstraints is supported.
+    if (state.videoTrack && typeof state.videoTrack.applyConstraints === 'function') {
+      try {
+        const caps = state.videoTrack.getCapabilities ? state.videoTrack.getCapabilities() : null;
+        if (caps && caps.width && caps.height) {
+          await state.videoTrack.applyConstraints({
+            width:  { ideal: caps.width.max  || 4096 },
+            height: { ideal: caps.height.max || 2160 },
+            advanced: [
+              caps.focusMode    && caps.focusMode.includes('continuous')    ? { focusMode: 'continuous' }    : {},
+              caps.exposureMode && caps.exposureMode.includes('continuous') ? { exposureMode: 'continuous' } : {},
+              caps.whiteBalanceMode && caps.whiteBalanceMode.includes('continuous') ? { whiteBalanceMode: 'continuous' } : {},
+            ],
+          });
+        }
+      } catch (_) {}
+    }
+    // Build an ImageCapture so the shutter can grab a true still photo
+    // (not just a downscaled video frame) when supported.
+    state.imageCapture = null;
+    if (state.videoTrack && typeof window.ImageCapture === 'function') {
+      try { state.imageCapture = new ImageCapture(state.videoTrack); } catch (_) {}
+    }
+  }
+
+  try {
+    // Pre-prompt for permission with a minimal constraint so we can read
+    // device labels (labels are empty until permission is granted on most
+    // browsers), then re-open with the best deviceId.
+    try {
+      const tmp = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: state.facing } }, audio: false
+      });
+      tmp.getTracks().forEach(t => t.stop());
+    } catch (_) {}
+    const bestId = await chooseBestEnvironmentDevice();
+    state.chosenDeviceId = bestId;
+    if (bestId) {
+      await open({ deviceId: { exact: bestId }, ...baseVideo });
+    } else {
+      await open({ facingMode: { ideal: state.facing }, ...baseVideo });
+    }
   } catch (e) {
-    toast('카메라 접근 실패: ' + e.message, 3000);
+    // Final fallback: minimal constraints.
+    try {
+      await open({ facingMode: { ideal: state.facing } });
+    } catch (e2) {
+      toast('카메라 접근 실패: ' + (e.message || e), 3000);
+    }
   }
 }
 function stopCamera() {
   if (state.stream) { state.stream.getTracks().forEach(t=>t.stop()); state.stream = null; }
+  state.videoTrack = null;
+  state.imageCapture = null;
 }
 
 $('btn-flip').onclick = () => {
@@ -423,17 +533,55 @@ $('btn-flip').onclick = () => {
 
 $('btn-shutter').onclick = captureFrame;
 
-function captureFrame() {
+// Capture quality: 0.96 strikes a balance between visual quality and file
+// size for JPEG. We keep the original sensor resolution.
+const CAPTURE_JPEG_QUALITY = 0.96;
+
+async function captureFrame() {
   const v = $('video');
   if (!v.videoWidth) { toast('카메라 준비 중'); return; }
-  const c = document.createElement('canvas');
-  c.width = v.videoWidth; c.height = v.videoHeight;
-  c.getContext('2d').drawImage(v, 0, 0);
-  const dataUrl = c.toDataURL('image/jpeg', 0.92);
+
+  let canvas = null;
+
+  // Best path: ImageCapture.takePhoto() grabs an actual still photo at
+  // the highest resolution the sensor will give us — typically larger
+  // and sharper than the video preview.
+  if (state.imageCapture && typeof state.imageCapture.takePhoto === 'function') {
+    try {
+      let photoOpts = {};
+      try {
+        const caps = await state.imageCapture.getPhotoCapabilities();
+        if (caps && caps.imageWidth && caps.imageHeight) {
+          photoOpts = {
+            imageWidth:  caps.imageWidth.max  || undefined,
+            imageHeight: caps.imageHeight.max || undefined,
+          };
+        }
+      } catch (_) {}
+      const blob = await state.imageCapture.takePhoto(photoOpts);
+      const bmp = await createImageBitmap(blob);
+      canvas = document.createElement('canvas');
+      canvas.width = bmp.width; canvas.height = bmp.height;
+      canvas.getContext('2d').drawImage(bmp, 0, 0);
+      bmp.close && bmp.close();
+    } catch (e) {
+      console.warn('ImageCapture takePhoto failed, falling back:', e);
+      canvas = null;
+    }
+  }
+
+  // Fallback: draw the current video frame at its native resolution.
+  if (!canvas) {
+    canvas = document.createElement('canvas');
+    canvas.width = v.videoWidth; canvas.height = v.videoHeight;
+    canvas.getContext('2d').drawImage(v, 0, 0);
+  }
+
+  const dataUrl = canvas.toDataURL('image/jpeg', CAPTURE_JPEG_QUALITY);
   openCrop({
     id: 'p' + Date.now() + Math.random().toString(36).slice(2,6),
     srcDataUrl: dataUrl,
-    srcW: c.width, srcH: c.height,
+    srcW: canvas.width, srcH: canvas.height,
     corners: null, rotation: 0, history: [],
     dataUrl: null,
   }, /*isNew=*/true);
@@ -681,7 +829,7 @@ function rotateSource90() {
     ctx.translate(c.width, 0);
     ctx.rotate(Math.PI/2);
     ctx.drawImage(img, 0, 0);
-    p.srcDataUrl = c.toDataURL('image/jpeg', 0.92);
+    p.srcDataUrl = c.toDataURL('image/jpeg', 0.96);
     [p.srcW, p.srcH] = [c.width, c.height];
     // Rotate corners
     p.corners = p.corners.map(([x,y]) => [p.srcW - y, x]);
@@ -947,7 +1095,7 @@ async function warpCrop(page) {
     out.width = outW; out.height = outH;
     cv.imshow(out, dst);
     src.delete(); dst.delete(); srcTri.delete(); dstTri.delete(); M.delete();
-    return out.toDataURL('image/jpeg', 0.92);
+    return out.toDataURL('image/jpeg', 0.96);
   } else {
     // Fallback: bounding box
     const xs = page.corners.map(p=>p[0]), ys = page.corners.map(p=>p[1]);
@@ -957,7 +1105,7 @@ async function warpCrop(page) {
     const c = document.createElement('canvas');
     c.width = w; c.height = h;
     c.getContext('2d').drawImage(img, x0, y0, w, h, 0, 0, w, h);
-    return c.toDataURL('image/jpeg', 0.92);
+    return c.toDataURL('image/jpeg', 0.96);
   }
 }
 
