@@ -117,6 +117,10 @@
     cursor: grab;
     touch-action: none;
   }
+  .crop-handle.edge {
+    fill: #2a78d4; stroke: #fff; stroke-width: 2;
+    opacity: 0.92;
+  }
   #crop-svg { touch-action: none; }
   .crop-line { stroke: #4ea1ff; stroke-width: 2; fill: rgba(78,161,255,0.12); }
   .crop-bottom {
@@ -129,11 +133,29 @@
     padding: 10px 14px; border-radius: 20px;
     font-size: 14px; font-weight: 500; cursor: pointer;
     display: flex; align-items: center; gap: 6px;
+    transition: background 0.08s, transform 0.08s, border-color 0.08s, color 0.08s;
+  }
+  .crop-bottom button:active {
+    background: #4ea1ff; border-color: #4ea1ff; color: #fff;
+    transform: scale(0.96);
   }
   .crop-bottom button.primary {
     background: #4ea1ff; border-color: #4ea1ff;
   }
+  .crop-bottom button.toggled {
+    background: #2a3a52; border-color: #4ea1ff; color: #4ea1ff;
+  }
   .crop-bottom button:disabled { opacity: 0.4; }
+
+  /* Global pressed feedback */
+  .text-btn:active:not(:disabled) {
+    background: rgba(78,161,255,0.15); border-radius: 14px;
+  }
+  .done-btn:active:not(:disabled) {
+    background: #2a78d4; transform: scale(0.96);
+  }
+  .shutter:active { transform: scale(0.92); }
+  .modal .opt:active { background: #3a3a3a; transform: scale(0.99); }
 
   /* Pages list */
   #pages-grid {
@@ -250,7 +272,10 @@
   <div class="topbar">
     <button class="icon-btn" id="btn-crop-back">←</button>
     <div class="title">자르기</div>
-    <button class="text-btn" id="btn-crop-save">저장</button>
+    <div style="display:flex; gap:2px;">
+      <button class="text-btn" id="btn-crop-continue">계속</button>
+      <button class="text-btn" id="btn-crop-finish">종료</button>
+    </div>
   </div>
   <div id="crop-stage">
     <div id="crop-canvas-wrap">
@@ -422,6 +447,7 @@ let dragHandle = null;
 
 function openCrop(page, isNew) {
   state.pending = { page, isNew };
+  setAutoBtnMode('auto');
   cropImg.onload = () => {
     const rect = cropImg.getBoundingClientRect();
     displayScale = rect.width / page.srcW;
@@ -454,56 +480,72 @@ function defaultCorners(w, h) {
 // just mutate cx/cy/points in place — rewriting innerHTML on every pointermove
 // destroys the element holding pointer capture, which is what was causing the
 // drag to feel choppy / "stuck".
+// Renders both corner handles (4) and edge-midpoint handles (4). Edge handles
+// let the user drag a whole side at once. We only rewrite innerHTML when the
+// handle set changes; during a drag we mutate attributes in place so the
+// element holding pointer capture is not destroyed.
 function drawCorners() {
   const p = state.pending.page;
   const pts = p.corners.map(([x,y]) => [x*displayScale, y*displayScale]);
-  const handles = cropSvg.querySelectorAll('.crop-handle');
+  const mids = pts.map((pt, i) => {
+    const next = pts[(i+1)%4];
+    return [(pt[0]+next[0])/2, (pt[1]+next[1])/2];
+  });
+  const cornerHandles = cropSvg.querySelectorAll('.crop-handle.corner');
+  const edgeHandles = cropSvg.querySelectorAll('.crop-handle.edge');
   let poly = cropSvg.querySelector('.crop-line');
-  if (handles.length !== pts.length || !poly) {
+  if (cornerHandles.length !== 4 || edgeHandles.length !== 4 || !poly) {
     cropSvg.innerHTML = `
       <polygon class="crop-line" points="${pts.map(pt=>pt.join(',')).join(' ')}"/>
-      ${pts.map((pt,i)=>`<circle class="crop-handle" data-i="${i}" cx="${pt[0]}" cy="${pt[1]}" r="16"></circle>`).join('')}
+      ${mids.map((pt,i)=>`<circle class="crop-handle edge" data-type="edge" data-i="${i}" cx="${pt[0]}" cy="${pt[1]}" r="12"></circle>`).join('')}
+      ${pts.map((pt,i)=>`<circle class="crop-handle corner" data-type="corner" data-i="${i}" cx="${pt[0]}" cy="${pt[1]}" r="16"></circle>`).join('')}
     `;
     cropSvg.querySelectorAll('.crop-handle').forEach(h => {
       h.addEventListener('pointerdown', onHandleDown);
     });
   } else {
     poly.setAttribute('points', pts.map(pt=>pt.join(',')).join(' '));
-    handles.forEach((h, i) => {
-      h.setAttribute('cx', pts[i][0]);
-      h.setAttribute('cy', pts[i][1]);
-    });
+    cornerHandles.forEach((h, i) => { h.setAttribute('cx', pts[i][0]); h.setAttribute('cy', pts[i][1]); });
+    edgeHandles.forEach((h, i) => { h.setAttribute('cx', mids[i][0]); h.setAttribute('cy', mids[i][1]); });
   }
 }
 
 let dragPointerId = null;
-let dragOffset = [0, 0]; // pointer offset from corner center, in source coords
+let dragType = null;          // 'corner' | 'edge'
+let dragIndex = null;
+let dragOffset = [0, 0];      // for corner drags
+let dragStartPointer = null;  // for edge drags (source coords)
+let dragStartCorners = null;  // snapshot for edge drags
 let dragRaf = 0;
 let dragLastEvent = null;
 
 function onHandleDown(e) {
   e.preventDefault();
-  dragHandle = parseInt(e.currentTarget.dataset.i, 10);
+  const el = e.currentTarget;
+  dragType = el.dataset.type || 'corner';
+  dragIndex = parseInt(el.dataset.i, 10);
+  dragHandle = dragIndex;
   dragPointerId = e.pointerId;
   const rect = cropImg.getBoundingClientRect();
   const px = (e.clientX - rect.left) / displayScale;
   const py = (e.clientY - rect.top) / displayScale;
-  const [cx, cy] = state.pending.page.corners[dragHandle];
-  // Lock to the offset between finger and corner center so the corner doesn't
-  // "snap" to the finger on touchdown.
-  dragOffset = [cx - px, cy - py];
-  try { e.currentTarget.setPointerCapture(e.pointerId); } catch (_) {}
-  // Listen on window so we keep tracking even if the pointer leaves the SVG
-  // or if we end up re-rendering the captured element.
+  const p = state.pending.page;
+  if (dragType === 'corner') {
+    const [cx, cy] = p.corners[dragIndex];
+    dragOffset = [cx - px, cy - py];
+  } else {
+    dragStartPointer = [px, py];
+    dragStartCorners = p.corners.map(c => [c[0], c[1]]);
+  }
+  try { el.setPointerCapture(e.pointerId); } catch (_) {}
   window.addEventListener('pointermove', onHandleMove, { passive: false });
   window.addEventListener('pointerup', onHandleUp);
   window.addEventListener('pointercancel', onHandleUp);
-  // Push history snapshot before moving
   pushHistory();
 }
 
 function onHandleMove(e) {
-  if (dragHandle == null) return;
+  if (dragIndex == null) return;
   if (dragPointerId != null && e.pointerId !== dragPointerId) return;
   e.preventDefault();
   dragLastEvent = e;
@@ -511,15 +553,32 @@ function onHandleMove(e) {
   dragRaf = requestAnimationFrame(() => {
     dragRaf = 0;
     const ev = dragLastEvent;
-    if (!ev || dragHandle == null) return;
+    if (!ev || dragIndex == null) return;
     const rect = cropImg.getBoundingClientRect();
-    const x = (ev.clientX - rect.left) / displayScale + dragOffset[0];
-    const y = (ev.clientY - rect.top) / displayScale + dragOffset[1];
+    const px = (ev.clientX - rect.left) / displayScale;
+    const py = (ev.clientY - rect.top) / displayScale;
     const p = state.pending.page;
-    p.corners[dragHandle] = [
-      Math.max(0, Math.min(p.srcW, x)),
-      Math.max(0, Math.min(p.srcH, y))
-    ];
+    if (dragType === 'corner') {
+      p.corners[dragIndex] = [
+        Math.max(0, Math.min(p.srcW, px + dragOffset[0])),
+        Math.max(0, Math.min(p.srcH, py + dragOffset[1]))
+      ];
+    } else {
+      // Translate the two corners sharing this edge by the same delta.
+      let dx = px - dragStartPointer[0];
+      let dy = py - dragStartPointer[1];
+      const i0 = dragIndex, i1 = (dragIndex + 1) % 4;
+      const a0 = dragStartCorners[i0], a1 = dragStartCorners[i1];
+      // Clamp delta so neither corner leaves the image.
+      const minDx = Math.max(-a0[0], -a1[0]);
+      const maxDx = Math.min(p.srcW - a0[0], p.srcW - a1[0]);
+      const minDy = Math.max(-a0[1], -a1[1]);
+      const maxDy = Math.min(p.srcH - a0[1], p.srcH - a1[1]);
+      dx = Math.max(minDx, Math.min(maxDx, dx));
+      dy = Math.max(minDy, Math.min(maxDy, dy));
+      p.corners[i0] = [a0[0] + dx, a0[1] + dy];
+      p.corners[i1] = [a1[0] + dx, a1[1] + dy];
+    }
     drawCorners();
   });
 }
@@ -527,7 +586,11 @@ function onHandleMove(e) {
 function onHandleUp(e) {
   if (dragPointerId != null && e && e.pointerId !== dragPointerId) return;
   dragHandle = null;
+  dragIndex = null;
+  dragType = null;
   dragPointerId = null;
+  dragStartPointer = null;
+  dragStartCorners = null;
   if (dragRaf) { cancelAnimationFrame(dragRaf); dragRaf = 0; }
   dragLastEvent = null;
   window.removeEventListener('pointermove', onHandleMove);
@@ -560,16 +623,40 @@ $('btn-reset').onclick = () => {
   p.corners = [[0,0],[p.srcW,0],[p.srcW,p.srcH],[0,p.srcH]];
   drawCorners();
 };
+// The 자동 button toggles between "자동" (run edge detection) and
+// "수동" (clear to default rectangle so the user can adjust freely).
+// Each press swaps the label and applies the new mode.
+let autoBtnMode = 'auto'; // current mode the button label shows
+function setAutoBtnMode(mode) {
+  autoBtnMode = mode;
+  const btn = $('btn-auto');
+  if (mode === 'auto') {
+    btn.textContent = '⌖ 자동';
+    btn.classList.remove('toggled');
+  } else {
+    btn.textContent = '✥ 수동';
+    btn.classList.add('toggled');
+  }
+}
 $('btn-auto').onclick = async () => {
   pushHistory();
-  showLoader(true);
-  let c = null;
-  try { c = await autoDetect(); } finally { showLoader(false); }
-  if (c) {
-    state.pending.page.corners = c;
+  const p = state.pending.page;
+  if (autoBtnMode === 'auto') {
+    loader(true, '인식 중…');
+    let c = null;
+    try { c = await autoDetect(); } finally { loader(false); }
+    if (c) {
+      p.corners = c;
+      toast('자동 인식 완료');
+    } else {
+      p.corners = defaultCorners(p.srcW, p.srcH);
+      toast('자동 인식 실패 — 직접 조정해 주세요');
+    }
+    setAutoBtnMode('manual');
   } else {
-    state.pending.page.corners = defaultCorners(state.pending.page.srcW, state.pending.page.srcH);
-    try { toast && toast('자동 인식 실패 — 모서리를 직접 조정해 주세요'); } catch (_) {}
+    p.corners = defaultCorners(p.srcW, p.srcH);
+    toast('수동 조정 모드');
+    setAutoBtnMode('auto');
   }
   drawCorners();
 };
@@ -621,9 +708,11 @@ $('btn-crop-back').onclick = () => {
   }
 };
 
-$('btn-crop-save').onclick = async () => {
+// Commit the current crop to state.pages. Returns true on success.
+async function commitCurrentCrop() {
+  const p = state.pending && state.pending.page;
+  if (!p) return false;
   loader(true, '자르는 중…');
-  const p = state.pending.page;
   try {
     const out = await warpCrop(p);
     p.dataUrl = out;
@@ -637,12 +726,34 @@ $('btn-crop-save').onclick = async () => {
     refreshPagesUI();
     refreshThumb();
     loader(false);
-    show('camera');
-    toast('페이지 저장됨');
+    return true;
   } catch (e) {
     loader(false);
     toast('자르기 실패: ' + e.message, 2500);
+    return false;
   }
+}
+
+// 계속: save current crop and return to the camera for more shots.
+$('btn-crop-continue').onclick = async () => {
+  const ok = await commitCurrentCrop();
+  if (!ok) return;
+  show('camera');
+  toast('저장됨 — 계속 촬영하세요');
+};
+
+// 종료: save current crop, then open the export dialog so the user can
+// finalize all pages they've captured so far.
+$('btn-crop-finish').onclick = async () => {
+  const ok = await commitCurrentCrop();
+  if (!ok) return;
+  if (state.pages.length === 0) {
+    show('camera');
+    return;
+  }
+  refreshPagesUI();
+  show('pages');
+  $('modal-export').classList.add('active');
 };
 
 /* ---------- Auto detect (OpenCV) ---------- */
