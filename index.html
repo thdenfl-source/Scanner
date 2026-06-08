@@ -7,7 +7,16 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="theme-color" content="#0a0a0a">
 <title>DocScan</title>
-<script src="https://docs.opencv.org/4.9.0/opencv.js" async></script>
+<script>
+  // Must be defined BEFORE opencv.js loads, otherwise the async script may
+  // initialize before our handler is attached and cvReady never flips to true.
+  window.Module = {
+    onRuntimeInitialized() {
+      try { window.__cvReady = true; } catch (_) {}
+    }
+  };
+</script>
+<script src="https://docs.opencv.org/4.9.0/opencv.js" async onload="window.__cvLoaded=true"></script>
 <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 <style>
@@ -334,9 +343,34 @@ const state = {
   cvReady: false,
 };
 
-window.Module = {
-  onRuntimeInitialized() { state.cvReady = true; }
-};
+// OpenCV readiness: window.Module was installed in <head> before opencv.js.
+// Mirror that flag here and also poll, in case the runtime initialized before
+// this script ran (race with the async opencv.js script).
+if (window.__cvReady) state.cvReady = true;
+(function waitCv() {
+  if (state.cvReady) return;
+  if (window.__cvReady || (typeof cv !== 'undefined' && cv && typeof cv.Mat === 'function')) {
+    state.cvReady = true;
+    return;
+  }
+  setTimeout(waitCv, 150);
+})();
+
+async function ensureCvReady(timeoutMs = 8000) {
+  if (state.cvReady) return true;
+  const start = Date.now();
+  return new Promise(resolve => {
+    (function poll() {
+      if (state.cvReady || window.__cvReady ||
+          (typeof cv !== 'undefined' && cv && typeof cv.Mat === 'function')) {
+        state.cvReady = true;
+        return resolve(true);
+      }
+      if (Date.now() - start > timeoutMs) return resolve(false);
+      setTimeout(poll, 150);
+    })();
+  });
+}
 
 /* ---------- Camera ---------- */
 async function startCamera() {
@@ -479,8 +513,15 @@ $('btn-reset').onclick = () => {
 };
 $('btn-auto').onclick = async () => {
   pushHistory();
-  const c = await autoDetect();
-  state.pending.page.corners = c || defaultCorners(state.pending.page.srcW, state.pending.page.srcH);
+  showLoader(true);
+  let c = null;
+  try { c = await autoDetect(); } finally { showLoader(false); }
+  if (c) {
+    state.pending.page.corners = c;
+  } else {
+    state.pending.page.corners = defaultCorners(state.pending.page.srcW, state.pending.page.srcH);
+    try { toast && toast('자동 인식 실패 — 모서리를 직접 조정해 주세요'); } catch (_) {}
+  }
   drawCorners();
 };
 $('btn-rotate').onclick = () => {
@@ -557,52 +598,152 @@ $('btn-crop-save').onclick = async () => {
 
 /* ---------- Auto detect (OpenCV) ---------- */
 async function autoDetect() {
-  if (!state.cvReady || typeof cv === 'undefined') return null;
+  const ok = await ensureCvReady();
+  if (!ok || typeof cv === 'undefined') {
+    console.warn('OpenCV not ready');
+    return null;
+  }
+  const p = state.pending && state.pending.page;
+  if (!p) return null;
+
+  let src, work, gray, blur, edges, kernel, contours, hier;
   try {
-    const p = state.pending.page;
     const img = new Image();
-    await new Promise(r => { img.onload = r; img.src = p.srcDataUrl; });
+    await new Promise((res, rej) => { img.onload = res; img.onerror = rej; img.src = p.srcDataUrl; });
     const c = document.createElement('canvas');
     c.width = img.width; c.height = img.height;
     c.getContext('2d').drawImage(img, 0, 0);
-    const src = cv.imread(c);
-    const gray = new cv.Mat();
-    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-    cv.GaussianBlur(gray, gray, new cv.Size(5,5), 0);
-    const edges = new cv.Mat();
-    cv.Canny(gray, edges, 50, 150);
-    const kernel = cv.Mat.ones(5,5,cv.CV_8U);
-    cv.dilate(edges, edges, kernel);
-    const contours = new cv.MatVector();
-    const hier = new cv.Mat();
-    cv.findContours(edges, contours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-    let best = null, bestArea = 0;
-    const totalArea = img.width * img.height;
-    for (let i = 0; i < contours.size(); i++) {
-      const cnt = contours.get(i);
-      const peri = cv.arcLength(cnt, true);
-      const approx = new cv.Mat();
-      cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
-      if (approx.rows === 4) {
-        const area = Math.abs(cv.contourArea(approx));
-        if (area > bestArea && area > totalArea * 0.1) {
-          bestArea = area;
-          best = [];
-          for (let j = 0; j < 4; j++) {
-            best.push([approx.data32S[j*2], approx.data32S[j*2+1]]);
+    src = cv.imread(c);
+
+    // Downscale to a manageable working size — robust + fast.
+    const maxSide = 1000;
+    const scale = Math.min(1, maxSide / Math.max(src.cols, src.rows));
+    work = new cv.Mat();
+    if (scale < 1) {
+      cv.resize(src, work, new cv.Size(Math.round(src.cols*scale), Math.round(src.rows*scale)), 0, 0, cv.INTER_AREA);
+    } else {
+      src.copyTo(work);
+    }
+
+    gray = new cv.Mat();
+    cv.cvtColor(work, gray, cv.COLOR_RGBA2GRAY);
+    blur = new cv.Mat();
+    cv.GaussianBlur(gray, blur, new cv.Size(5,5), 0);
+
+    const W = work.cols, H = work.rows;
+    const totalArea = W * H;
+    const invScale = scale > 0 ? 1/scale : 1;
+
+    // Try several edge strategies; keep the best 4-point quad across all.
+    const strategies = [];
+    // 1) Otsu-derived Canny thresholds
+    const otsuTmp = new cv.Mat();
+    const otsuThr = cv.threshold(blur, otsuTmp, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+    otsuTmp.delete();
+    strategies.push([Math.max(10, otsuThr*0.5), Math.min(255, otsuThr)]);
+    // 2) Classic fixed pair
+    strategies.push([50, 150]);
+    // 3) Wider, more permissive
+    strategies.push([30, 90]);
+    // 4) Tighter, for high-contrast scenes
+    strategies.push([75, 200]);
+
+    kernel = cv.Mat.ones(3,3,cv.CV_8U);
+    let best = null, bestScore = 0;
+
+    for (const [lo, hi] of strategies) {
+      edges = new cv.Mat();
+      cv.Canny(blur, edges, lo, hi);
+      // Close gaps so book/whiteboard borders form a continuous contour.
+      cv.morphologyEx(edges, edges, cv.MORPH_CLOSE, kernel);
+      cv.dilate(edges, edges, kernel);
+
+      contours = new cv.MatVector();
+      hier = new cv.Mat();
+      cv.findContours(edges, contours, hier, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
+
+      // Collect contours with their areas, sort desc, examine top N.
+      const list = [];
+      for (let i = 0; i < contours.size(); i++) {
+        const cnt = contours.get(i);
+        const a = Math.abs(cv.contourArea(cnt));
+        if (a > totalArea * 0.05) list.push({ cnt, a });
+        else cnt.delete();
+      }
+      list.sort((x, y) => y.a - x.a);
+      const top = list.slice(0, 8);
+      // free the rest
+      for (let i = 8; i < list.length; i++) list[i].cnt.delete();
+
+      for (const { cnt, a } of top) {
+        const peri = cv.arcLength(cnt, true);
+        let quad = null;
+        // Try several epsilon factors before falling back to a convex-hull approx.
+        for (const eps of [0.02, 0.03, 0.04, 0.05, 0.06, 0.08]) {
+          const ap = new cv.Mat();
+          cv.approxPolyDP(cnt, ap, eps * peri, true);
+          if (ap.rows === 4 && cv.isContourConvex(ap)) {
+            quad = [];
+            for (let j = 0; j < 4; j++) quad.push([ap.data32S[j*2], ap.data32S[j*2+1]]);
+            ap.delete();
+            break;
           }
+          ap.delete();
+        }
+        if (!quad) {
+          // Fallback: convex hull then approx — handles noisy/broken edges.
+          const hull = new cv.Mat();
+          cv.convexHull(cnt, hull, false, true);
+          const hPeri = cv.arcLength(hull, true);
+          for (const eps of [0.02, 0.03, 0.04, 0.05, 0.07, 0.1]) {
+            const ap = new cv.Mat();
+            cv.approxPolyDP(hull, ap, eps * hPeri, true);
+            if (ap.rows === 4 && cv.isContourConvex(ap)) {
+              quad = [];
+              for (let j = 0; j < 4; j++) quad.push([ap.data32S[j*2], ap.data32S[j*2+1]]);
+              ap.delete();
+              break;
+            }
+            ap.delete();
+          }
+          hull.delete();
+        }
+        cnt.delete();
+
+        if (!quad) continue;
+        // Score: prefer larger area, but penalize quads that cover almost the
+        // entire frame (likely the image border itself).
+        const frac = a / totalArea;
+        if (frac > 0.985) continue;
+        const score = a * (frac > 0.95 ? 0.5 : 1);
+        if (score > bestScore) {
+          bestScore = score;
+          best = quad;
         }
       }
-      approx.delete(); cnt.delete();
+
+      contours.delete(); contours = null;
+      hier.delete(); hier = null;
+      edges.delete(); edges = null;
+      if (best && bestScore > totalArea * 0.25) break; // good enough
     }
-    src.delete(); gray.delete(); edges.delete(); kernel.delete();
-    contours.delete(); hier.delete();
+
     if (!best) return null;
-    // Order: TL, TR, BR, BL
-    return orderCorners(best);
+    // Rescale corners back to original image coordinates.
+    const scaled = best.map(([x,y]) => [Math.round(x*invScale), Math.round(y*invScale)]);
+    return orderCorners(scaled);
   } catch (e) {
     console.warn('auto detect error', e);
     return null;
+  } finally {
+    try { src && src.delete(); } catch (_) {}
+    try { work && work.delete(); } catch (_) {}
+    try { gray && gray.delete(); } catch (_) {}
+    try { blur && blur.delete(); } catch (_) {}
+    try { edges && edges.delete(); } catch (_) {}
+    try { kernel && kernel.delete(); } catch (_) {}
+    try { contours && contours.delete(); } catch (_) {}
+    try { hier && hier.delete(); } catch (_) {}
   }
 }
 
