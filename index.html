@@ -664,18 +664,29 @@ function defaultCorners(w, h) {
 // TM/BM mark the spine where the page meets the binding. A slight curl
 // is added by default so the curve fitting has something to work with;
 // the user can drag the spine handles to match the actual curve.
+// 8-point book outline (clockwise):
+//   [TL, TopMid, TR, RightMid, BR, BotMid, BL, LeftMid]
+// All four side midpoints are draggable so the user can shape each
+// edge as a quadratic Bezier through 3 points — this is what lets us
+// straighten not just the spine curl but the outer-edge curl on both
+// pages. Which pair is the "spine" depends on orientation:
+//   landscape: spine = (TopMid, BotMid)  [indices 1, 5]
+//   portrait : spine = (RightMid, LeftMid) [indices 3, 7]
 function defaultBookCorners(w, h) {
   const m = 0.05;
   const xL = w*m, xR = w*(1-m), xC = w/2;
-  const yT = h*m, yB = h*(1-m);
-  const curlY = h * 0.04; // page curves up at the spine
+  const yT = h*m, yB = h*(1-m), yC = h/2;
+  const curlSpine = h * 0.04;  // spine curl
+  const curlSide  = w * 0.015; // outer side curl (gentle by default)
   return [
-    [xL, yT],            // 0: TL
-    [xC, yT + curlY],    // 1: TM (spine top)
-    [xR, yT],            // 2: TR
-    [xR, yB],            // 3: BR
-    [xC, yB - curlY],    // 4: BM (spine bottom)
-    [xL, yB],            // 5: BL
+    [xL, yT],                       // 0 TL
+    [xC, yT + curlSpine],           // 1 TopMid (spine top)
+    [xR, yT],                       // 2 TR
+    [xR - curlSide, yC],            // 3 RightMid
+    [xR, yB],                       // 4 BR
+    [xC, yB - curlSpine],           // 5 BotMid (spine bottom)
+    [xL, yB],                       // 6 BL
+    [xL + curlSide, yC],            // 7 LeftMid
   ];
 }
 
@@ -695,51 +706,52 @@ function bezControl(p0, M, p2) {
 }
 function isBookMode(p) { return !!(p && p.bookOrient); }
 
-// Default 6-point layout for a *portrait* book (spine horizontal across
-// the middle, top page above, bottom page below). Order is clockwise:
-// [TL, TR, MR, BR, BL, ML] — ML/MR are the spine endpoints.
+// 8-point layout for a portrait book (spine horizontal). Same shape as
+// landscape — the orientation just decides which pair of midpoints is
+// treated as the spine.
 function defaultBookCornersPortrait(w, h) {
   const m = 0.05;
-  const xL = w*m, xR = w*(1-m);
+  const xL = w*m, xR = w*(1-m), xC = w/2;
   const yT = h*m, yB = h*(1-m), yC = h/2;
-  const curlX = w * 0.04; // spine curls inward at the side edges
+  const curlSpine = w * 0.04;
+  const curlSide  = h * 0.015;
   return [
-    [xL, yT],            // 0: TL
-    [xR, yT],            // 1: TR
-    [xR - curlX, yC],    // 2: MR (spine right)
-    [xR, yB],            // 3: BR
-    [xL, yB],            // 4: BL
-    [xL + curlX, yC],    // 5: ML (spine left)
+    [xL, yT],                       // 0 TL
+    [xC, yT + curlSide],            // 1 TopMid
+    [xR, yT],                       // 2 TR
+    [xR - curlSpine, yC],           // 3 RightMid (spine right)
+    [xR, yB],                       // 4 BR
+    [xC, yB - curlSide],            // 5 BotMid
+    [xL, yB],                       // 6 BL
+    [xL + curlSpine, yC],           // 7 LeftMid (spine left)
   ];
 }
 
-// Convert a detected 4-point quad into the appropriate book layout
-// based on the current orientation stored on the page.
 function fourToBookByOrient(c, p) {
   if (p.bookOrient === 'portrait') return fourToBookPortrait(c);
   return fourToBook(c, p.srcH);
 }
 function fourToBookPortrait(c) {
   const [TL, TR, BR, BL] = c;
-  const curl = Math.hypot(TR[0]-TL[0], TR[1]-TL[1]) * 0.04;
+  const sideW = Math.hypot(TR[0]-TL[0], TR[1]-TL[1]);
+  const sideH = Math.hypot(BL[0]-TL[0], BL[1]-TL[1]);
+  const curlSpine = sideW * 0.04;
+  const curlSide  = sideH * 0.015;
   return [
     TL,
+    [(TL[0]+TR[0])/2,             (TL[1]+TR[1])/2 + curlSide],
     TR,
-    [(TR[0]+BR[0])/2 - curl, (TR[1]+BR[1])/2],
+    [(TR[0]+BR[0])/2 - curlSpine, (TR[1]+BR[1])/2],
     BR,
+    [(BL[0]+BR[0])/2,             (BL[1]+BR[1])/2 - curlSide],
     BL,
-    [(TL[0]+BL[0])/2 + curl, (TL[1]+BL[1])/2],
+    [(TL[0]+BL[0])/2 + curlSpine, (TL[1]+BL[1])/2],
   ];
 }
 
-// Pull the outer 4 corners back out of a 6-point book outline.
+// Pull the outer 4 corners back out of an 8-point book outline.
 function outer4(p) {
-  if (p.bookOrient === 'portrait') {
-    // [TL, TR, MR, BR, BL, ML]
-    return [p.corners[0], p.corners[1], p.corners[3], p.corners[4]];
-  }
-  // landscape: [TL, TM, TR, BR, BM, BL]
-  return [p.corners[0], p.corners[2], p.corners[3], p.corners[5]];
+  return [p.corners[0], p.corners[2], p.corners[4], p.corners[6]];
 }
 
 // Rebuild the SVG only when the number of handles changes. During drags we
@@ -753,41 +765,38 @@ function outer4(p) {
 // Build an SVG path describing the crop outline. In book mode the spine
 // edge (top↔bottom for landscape, or left↔right for portrait) is drawn
 // as a quadratic Bezier that passes through the spine midpoints.
+// Build the SVG outline path. Non-book mode is a 4-point polygon. Book
+// mode (8 points) traces four quadratic Beziers: top (TL→TopMid→TR),
+// right (TR→RightMid→BR), bottom (BR→BotMid→BL) and left (BL→LeftMid
+// →TL), so every edge — including the outer page sides — can be a curve.
 function buildCropPath(pts, orient) {
   if (!orient) {
     return 'M ' + pts.map(p => p.join(',')).join(' L ') + ' Z';
   }
-  if (orient === 'portrait') {
-    const [TL, TR, MR, BR, BL, ML] = pts;
-    const cR = bezControl(TR, MR, BR);
-    const cL = bezControl(BL, ML, TL);
-    return `M ${TL[0]},${TL[1]}
-            L ${TR[0]},${TR[1]}
-            Q ${cR[0]},${cR[1]} ${BR[0]},${BR[1]}
-            L ${BL[0]},${BL[1]}
-            Q ${cL[0]},${cL[1]} ${TL[0]},${TL[1]} Z`;
-  }
-  // landscape (default)
-  const [TL, TM, TR, BR, BM, BL] = pts;
-  const cTop = bezControl(TL, TM, TR);
-  const cBot = bezControl(BR, BM, BL);
+  const [TL, TopMid, TR, RightMid, BR, BotMid, BL, LeftMid] = pts;
+  const cTop = bezControl(TL, TopMid, TR);
+  const cRgt = bezControl(TR, RightMid, BR);
+  const cBot = bezControl(BR, BotMid, BL);
+  const cLft = bezControl(BL, LeftMid, TL);
   return `M ${TL[0]},${TL[1]}
           Q ${cTop[0]},${cTop[1]} ${TR[0]},${TR[1]}
-          L ${BR[0]},${BR[1]}
-          Q ${cBot[0]},${cBot[1]} ${BL[0]},${BL[1]} Z`;
+          Q ${cRgt[0]},${cRgt[1]} ${BR[0]},${BR[1]}
+          Q ${cBot[0]},${cBot[1]} ${BL[0]},${BL[1]}
+          Q ${cLft[0]},${cLft[1]} ${TL[0]},${TL[1]} Z`;
 }
 function buildSpinePath(pts, orient) {
   if (orient === 'portrait') {
-    // ML → MR (indices 5, 2)
-    const ML = pts[5], MR = pts[2];
-    return `M ${ML[0]},${ML[1]} L ${MR[0]},${MR[1]}`;
+    // LeftMid (7) → RightMid (3)
+    return `M ${pts[7][0]},${pts[7][1]} L ${pts[3][0]},${pts[3][1]}`;
   }
-  // landscape: TM → BM (indices 1, 4)
-  const TM = pts[1], BM = pts[4];
-  return `M ${TM[0]},${TM[1]} L ${BM[0]},${BM[1]}`;
+  // landscape: TopMid (1) → BotMid (5)
+  return `M ${pts[1][0]},${pts[1][1]} L ${pts[5][0]},${pts[5][1]}`;
 }
+// In book mode, the side-midpoints are part of the outline (they shape
+// the curve) so we render them as draggable handles and mark the spine
+// pair with the orange "spine" style.
 function spineIndices(orient) {
-  return orient === 'portrait' ? new Set([2, 5]) : new Set([1, 4]);
+  return orient === 'portrait' ? new Set([3, 7]) : new Set([1, 5]);
 }
 
 function drawCorners() {
@@ -796,8 +805,11 @@ function drawCorners() {
   const bookMode = !!orient;
   const n = p.corners.length;
   const pts = p.corners.map(([x,y]) => [x*displayScale, y*displayScale]);
-  // Edge midpoint handles between each consecutive pair (n edges).
-  const mids = pts.map((pt, i) => {
+  // In book mode the side midpoints ARE corners (they shape the curve)
+  // so we don't draw additional edge-translation handles. In normal mode
+  // we still render midpoint handles between each consecutive pair so
+  // users can drag a whole side.
+  const mids = bookMode ? [] : pts.map((pt, i) => {
     const next = pts[(i+1)%n];
     return [(pt[0]+next[0])/2, (pt[1]+next[1])/2];
   });
@@ -808,7 +820,7 @@ function drawCorners() {
   const renderedOrient = cropSvg.dataset.orient || '';
   // Rebuild the SVG whenever the structure changes (handle count or
   // book orientation). During drags, mutate attributes only.
-  if (cornerHandles.length !== n || edgeHandles.length !== n || !path
+  if (cornerHandles.length !== n || edgeHandles.length !== mids.length || !path
       || renderedOrient !== (orient || '')) {
     const spineSet = bookMode ? spineIndices(orient) : new Set();
     cropSvg.innerHTML = `
@@ -947,18 +959,18 @@ $('btn-reset').onclick = () => {
   if (isBookMode(p)) {
     const w = p.srcW, h = p.srcH;
     if (p.bookOrient === 'portrait') {
-      const curl = w * 0.04;
+      const cs = w * 0.04, ce = h * 0.015;
       p.corners = [
-        [0, 0], [w, 0],
-        [w - curl, h/2],
-        [w, h], [0, h],
-        [curl, h/2],
+        [0, 0],            [w/2, ce],         [w, 0],
+        [w - cs, h/2],     [w, h],            [w/2, h - ce],
+        [0, h],            [cs, h/2],
       ];
     } else {
-      const curl = h * 0.04;
+      const cs = h * 0.04, ce = w * 0.015;
       p.corners = [
-        [0, 0], [w/2, curl], [w, 0],
-        [w, h], [w/2, h - curl], [0, h],
+        [0, 0],            [w/2, cs],         [w, 0],
+        [w - ce, h/2],     [w, h],            [w/2, h - cs],
+        [0, h],            [ce, h/2],
       ];
     }
   } else {
@@ -1042,19 +1054,24 @@ function setAutoBtnMode(mode) {
     btn.classList.add('toggled');
   }
 }
-// If a 4-corner result needs to fit a 6-point book outline, insert
-// spine top/bottom at the midpoint of the top/bottom edges with a small
-// curl bias so the curve fitting starts from a reasonable shape.
-function fourToBook(c, srcH) {
+// Expand 4 detected outer corners into the 8-point book outline.
+// Spine curl goes on the spine pair; a small inward bias is added to the
+// outer side midpoints so the user has something to grab and shape.
+function fourToBook(c, _unused) {
   const [TL, TR, BR, BL] = c;
-  const curl = Math.hypot(BL[0]-TL[0], BL[1]-TL[1]) * 0.04;
+  const sideH = Math.hypot(BL[0]-TL[0], BL[1]-TL[1]);
+  const sideW = Math.hypot(TR[0]-TL[0], TR[1]-TL[1]);
+  const curlSpine = sideH * 0.04;
+  const curlSide  = sideW * 0.015;
   return [
     TL,
-    [(TL[0]+TR[0])/2, (TL[1]+TR[1])/2 + curl],
+    [(TL[0]+TR[0])/2,             (TL[1]+TR[1])/2 + curlSpine],
     TR,
+    [(TR[0]+BR[0])/2 - curlSide,  (TR[1]+BR[1])/2],
     BR,
-    [(BL[0]+BR[0])/2, (BL[1]+BR[1])/2 - curl],
+    [(BL[0]+BR[0])/2,             (BL[1]+BR[1])/2 - curlSpine],
     BL,
+    [(TL[0]+BL[0])/2 + curlSide,  (TL[1]+BL[1])/2],
   ];
 }
 
@@ -1184,14 +1201,24 @@ async function commitCurrentCrop() {
   }
 }
 
-/* ---------- Book curve dewarp ----------
-   Inputs: page.corners is 6 points [TL, TM, TR, BR, BM, BL].
-   We model the top edge of the open book as a quadratic Bezier that
-   passes through (TL, TM, TR) and the bottom edge as one through
-   (BR, BM, BL). For each half-page, every output column maps to a
-   curve parameter t and we linearly interpolate between the top and
-   bottom curves at that t to find the source-image sample point.
-   This straightens the page-curl into a flat rectangle. */
+/* ---------- Book curve dewarp (Coons patch) ----------
+   page.corners is 8 points: [TL, TopMid, TR, RightMid, BR, BotMid, BL, LeftMid].
+   The four sides of the book outline are each modelled as a quadratic
+   Bezier that passes through three points (corner, mid, corner). The
+   patch interior is reconstructed with a *linear Coons patch* — a
+   classic bicubic/biquadratic stitching technique that produces a
+   smooth surface respecting all four boundary curves simultaneously:
+
+       P(u,v) = (1-v)·C_top(u) + v·C_bot(u)
+              + (1-u)·C_left(v) + u·C_right(v)
+              - bilinear interpolation of the four corners
+
+   So pixel (u, v) in the dewarped output maps back to a single source
+   sample point — and any curvature in *both* the spine AND the outer
+   page edges is removed.
+
+   Split: landscape book → left page covers u ∈ [0, 0.5] and right
+   page covers u ∈ [0.5, 1]. Portrait book splits along v instead. */
 async function warpBookSplit(page) {
   const img = new Image();
   await new Promise((res, rej) => { img.onload = res; img.onerror = rej; img.src = page.srcDataUrl; });
@@ -1206,31 +1233,33 @@ async function warpBookSplit(page) {
   const dist = (a,b) => Math.hypot(a[0]-b[0], a[1]-b[1]);
   const MAX_DIM = 2400;
   try {
+    const P = page.corners;
+    const TL=P[0], TopMid=P[1], TR=P[2], RightMid=P[3];
+    const BR=P[4], BotMid=P[5], BL=P[6], LeftMid=P[7];
+
     if (page.bookOrient === 'portrait') {
-      const [TL, TR, MR, BR, BL, ML] = page.corners;
-      // Top page is bounded by TL,TR on top and ML,MR on bottom.
-      // Bottom page is bounded by ML,MR on top and BL,BR on bottom.
-      const topH = Math.round(Math.max(dist(TL,ML), dist(TR,MR)));
-      const botH = Math.round(Math.max(dist(ML,BL), dist(MR,BR)));
-      const outW = Math.round(Math.max(dist(TL,TR), dist(ML,MR), dist(BL,BR)));
-      const scale = Math.min(1, MAX_DIM / Math.max(topH, botH, outW));
-      const oW = Math.max(8, Math.round(outW * scale));
+      // Split horizontally at v = 0.5 (spine is LeftMid–RightMid).
+      const W    = Math.round(Math.max(dist(TL,TR), dist(LeftMid,RightMid), dist(BL,BR)));
+      const topH = Math.round(Math.max(dist(TL,LeftMid),  dist(TR,RightMid)));
+      const botH = Math.round(Math.max(dist(LeftMid,BL),  dist(RightMid,BR)));
+      const scale = Math.min(1, MAX_DIM / Math.max(W, topH, botH));
+      const oW = Math.max(8, Math.round(W    * scale));
       const tH = Math.max(8, Math.round(topH * scale));
       const bH = Math.max(8, Math.round(botH * scale));
-      const topUrl = await remapPagePortrait(src, TL, TR, MR, BR, BL, ML, oW, tH, 'top');
-      const botUrl = await remapPagePortrait(src, TL, TR, MR, BR, BL, ML, oW, bH, 'bottom');
+      const topUrl = await remapBookPatch(src, P, oW, tH, 0, 1, 0,   0.5);
+      const botUrl = await remapBookPatch(src, P, oW, bH, 0, 1, 0.5, 0.5);
       return [topUrl, botUrl];
     } else {
-      const [TL, TM, TR, BR, BM, BL] = page.corners;
-      const leftW  = Math.round(Math.max(dist(TL,TM), dist(BL,BM)));
-      const rightW = Math.round(Math.max(dist(TR,TM), dist(BR,BM)));
-      const outH   = Math.round(Math.max(dist(TL,BL), dist(TM,BM), dist(TR,BR)));
-      const scale = Math.min(1, MAX_DIM / Math.max(leftW, rightW, outH));
+      // Split vertically at u = 0.5 (spine is TopMid–BotMid).
+      const leftW  = Math.round(Math.max(dist(TL,TopMid), dist(BL,BotMid)));
+      const rightW = Math.round(Math.max(dist(TopMid,TR), dist(BotMid,BR)));
+      const H      = Math.round(Math.max(dist(TL,BL),     dist(TopMid,BotMid), dist(TR,BR)));
+      const scale = Math.min(1, MAX_DIM / Math.max(leftW, rightW, H));
       const lW = Math.max(8, Math.round(leftW  * scale));
       const rW = Math.max(8, Math.round(rightW * scale));
-      const oH = Math.max(8, Math.round(outH   * scale));
-      const leftUrl  = await remapPage(src, TL, TM, TR, BR, BM, BL, lW, oH, 'left');
-      const rightUrl = await remapPage(src, TL, TM, TR, BR, BM, BL, rW, oH, 'right');
+      const oH = Math.max(8, Math.round(H      * scale));
+      const leftUrl  = await remapBookPatch(src, P, lW, oH, 0,   0.5, 0, 1);
+      const rightUrl = await remapBookPatch(src, P, rW, oH, 0.5, 0.5, 0, 1);
       return [leftUrl, rightUrl];
     }
   } finally {
@@ -1238,107 +1267,52 @@ async function warpBookSplit(page) {
   }
 }
 
-// Portrait book dewarp: the spine is horizontal and the two curved
-// edges are the left side (TL→ML→BL) and right side (TR→MR→BR). For
-// each output pixel (u,v) of a half-page we linearly interpolate
-// between the left curve at parameter t and the right curve at the
-// same t, where t runs along the side (top half: t ∈ [0,0.5]; bottom
-// half: t ∈ [0.5,1]).
-async function remapPagePortrait(src, TL, TR, MR, BR, BL, ML, outW, outH, half) {
-  const tStart = half === 'top' ? 0 : 0.5;
-  const tSpan = 0.5;
+// Render one half-page of the Coons patch defined by the 8-point book
+// outline P. uStart..uStart+uSpan and vStart..vStart+vSpan select the
+// rectangular region of the patch to sample.
+async function remapBookPatch(src, P, outW, outH, uStart, uSpan, vStart, vSpan) {
+  const TL=P[0], TopMid=P[1], TR=P[2], RightMid=P[3];
+  const BR=P[4], BotMid=P[5], BL=P[6], LeftMid=P[7];
 
-  // Left curve interpolates (TL, ML, BL); t=0 → TL, t=1 → BL.
-  const cLx = 2*ML[0] - 0.5*(TL[0] + BL[0]);
-  const cLy = 2*ML[1] - 0.5*(TL[1] + BL[1]);
-  // Right curve interpolates (TR, MR, BR).
-  const cRx = 2*MR[0] - 0.5*(TR[0] + BR[0]);
-  const cRy = 2*MR[1] - 0.5*(TR[1] + BR[1]);
+  // Bezier control points so each curve passes through its midpoint.
+  const CtopX = 2*TopMid[0]   - 0.5*(TL[0] + TR[0]);
+  const CtopY = 2*TopMid[1]   - 0.5*(TL[1] + TR[1]);
+  const CbotX = 2*BotMid[0]   - 0.5*(BL[0] + BR[0]);
+  const CbotY = 2*BotMid[1]   - 0.5*(BL[1] + BR[1]);
+  const ClftX = 2*LeftMid[0]  - 0.5*(TL[0] + BL[0]);
+  const ClftY = 2*LeftMid[1]  - 0.5*(TL[1] + BL[1]);
+  const CrgtX = 2*RightMid[0] - 0.5*(TR[0] + BR[0]);
+  const CrgtY = 2*RightMid[1] - 0.5*(TR[1] + BR[1]);
 
   const mxArr = new Float32Array(outW * outH);
   const myArr = new Float32Array(outW * outH);
 
   for (let oy = 0; oy < outH; oy++) {
-    const v = outH === 1 ? 0 : oy / (outH - 1);
-    const t = tStart + v * tSpan;
-    const it = 1 - t;
-    const lX = it*it*TL[0] + 2*it*t*cLx + t*t*BL[0];
-    const lY = it*it*TL[1] + 2*it*t*cLy + t*t*BL[1];
-    const rX = it*it*TR[0] + 2*it*t*cRx + t*t*BR[0];
-    const rY = it*it*TR[1] + 2*it*t*cRy + t*t*BR[1];
+    const v = vStart + (outH === 1 ? 0 : oy/(outH-1)) * vSpan;
+    const vt = 1 - v;
+    // Left and right curves only depend on v — hoist them out of the inner loop.
+    const lftX = vt*vt*TL[0] + 2*vt*v*ClftX + v*v*BL[0];
+    const lftY = vt*vt*TL[1] + 2*vt*v*ClftY + v*v*BL[1];
+    const rgtX = vt*vt*TR[0] + 2*vt*v*CrgtX + v*v*BR[0];
+    const rgtY = vt*vt*TR[1] + 2*vt*v*CrgtY + v*v*BR[1];
     for (let ox = 0; ox < outW; ox++) {
-      const u = outW === 1 ? 0 : ox / (outW - 1);
-      const sx = (1 - u) * lX + u * rX;
-      const sy = (1 - u) * lY + u * rY;
-      const off = oy * outW + ox;
+      const u = uStart + (outW === 1 ? 0 : ox/(outW-1)) * uSpan;
+      const ut = 1 - u;
+      // Top and bottom curves depend on u.
+      const topX = ut*ut*TL[0] + 2*ut*u*CtopX + u*u*TR[0];
+      const topY = ut*ut*TL[1] + 2*ut*u*CtopY + u*u*TR[1];
+      const botX = ut*ut*BL[0] + 2*ut*u*CbotX + u*u*BR[0];
+      const botY = ut*ut*BL[1] + 2*ut*u*CbotY + u*u*BR[1];
+      // Bilinear of the four corner points, which the patch formula subtracts.
+      const blX = vt*ut*TL[0] + vt*u*TR[0] + v*ut*BL[0] + v*u*BR[0];
+      const blY = vt*ut*TL[1] + vt*u*TR[1] + v*ut*BL[1] + v*u*BR[1];
+      const sx = vt*topX + v*botX + ut*lftX + u*rgtX - blX;
+      const sy = vt*topY + v*botY + ut*lftY + u*rgtY - blY;
+      const off = oy*outW + ox;
       mxArr[off] = sx;
       myArr[off] = sy;
     }
     if (oy % 64 === 0) await new Promise(r => setTimeout(r, 0));
-  }
-
-  const mapX = new cv.Mat(outH, outW, cv.CV_32FC1);
-  const mapY = new cv.Mat(outH, outW, cv.CV_32FC1);
-  const dst = new cv.Mat();
-  try {
-    mapX.data32F.set(mxArr);
-    mapY.data32F.set(myArr);
-    cv.remap(src, dst, mapX, mapY, cv.INTER_LINEAR, cv.BORDER_REPLICATE);
-    const outCanvas = document.createElement('canvas');
-    outCanvas.width = outW; outCanvas.height = outH;
-    cv.imshow(outCanvas, dst);
-    return outCanvas.toDataURL('image/jpeg', 0.96);
-  } finally {
-    mapX.delete(); mapY.delete(); dst.delete();
-  }
-}
-
-// Render one half-page using cv.remap with maps computed from the
-// quadratic Bezier curves fitted to the top and bottom edges.
-async function remapPage(src, TL, TM, TR, BR, BM, BL, outW, outH, side) {
-  // Half of the bezier parameter belongs to each page.
-  // Left page uses t ∈ [0, 0.5], right page t ∈ [0.5, 1.0].
-  const tStart = side === 'left' ? 0 : 0.5;
-  const tSpan  = 0.5;
-
-  const cTopX = 2*TM[0] - 0.5*(TL[0] + TR[0]);
-  const cTopY = 2*TM[1] - 0.5*(TL[1] + TR[1]);
-  // Bottom curve goes BR → BM → BL (clockwise), so its endpoints are BR, BL.
-  const cBotX = 2*BM[0] - 0.5*(BR[0] + BL[0]);
-  const cBotY = 2*BM[1] - 0.5*(BR[1] + BL[1]);
-
-  const mxArr = new Float32Array(outW * outH);
-  const myArr = new Float32Array(outW * outH);
-
-  for (let oy = 0; oy < outH; oy++) {
-    const v = outH === 1 ? 0 : oy / (outH - 1);
-    for (let ox = 0; ox < outW; ox++) {
-      const u = outW === 1 ? 0 : ox / (outW - 1);
-      const t = tStart + u * tSpan;
-      const it = 1 - t;
-      // top point on the curve at param t
-      const topX = it*it*TL[0] + 2*it*t*cTopX + t*t*TR[0];
-      const topY = it*it*TL[1] + 2*it*t*cTopY + t*t*TR[1];
-      // bottom curve was BR→BL, so swap endpoints accordingly.
-      // We want u=0 → BL (left edge bottom) and u=1 → BR (right edge bottom)
-      // i.e. t' for bottom such that t'=0 corresponds to BL... but we already
-      // built cBot from (BR, BM, BL), where t=0 is BR. So to align with the
-      // top (which goes TL→TR as t grows), invert: use (1 - t) on bottom.
-      const tb = 1 - t;
-      const itb = 1 - tb;
-      const botX = itb*itb*BR[0] + 2*itb*tb*cBotX + tb*tb*BL[0];
-      const botY = itb*itb*BR[1] + 2*itb*tb*cBotY + tb*tb*BL[1];
-
-      const sx = (1 - v) * topX + v * botX;
-      const sy = (1 - v) * topY + v * botY;
-      const off = oy * outW + ox;
-      mxArr[off] = sx;
-      myArr[off] = sy;
-    }
-    if (oy % 64 === 0) {
-      // Yield to the UI thread occasionally so the loader stays responsive.
-      await new Promise(r => setTimeout(r, 0));
-    }
   }
 
   const mapX = new cv.Mat(outH, outW, cv.CV_32FC1);
