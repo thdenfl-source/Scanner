@@ -121,6 +121,10 @@
     fill: #2a78d4; stroke: #fff; stroke-width: 2;
     opacity: 0.92;
   }
+  .crop-handle.spine {
+    fill: #f5a623; stroke: #fff; stroke-width: 2;
+  }
+  .crop-spine { stroke: #f5a623; stroke-width: 2; fill: none; stroke-dasharray: 6 4; }
   #crop-svg { touch-action: none; }
   .crop-line { stroke: #4ea1ff; stroke-width: 2; fill: rgba(78,161,255,0.12); }
   .crop-bottom {
@@ -285,6 +289,7 @@
   </div>
   <div class="crop-bottom">
     <button id="btn-auto">⌖ 자동</button>
+    <button id="btn-book">📖 책</button>
     <button id="btn-reset">⟲ 전체</button>
     <button id="btn-undo" disabled>↶ 되돌리기</button>
     <button id="btn-rotate">↻ 회전</button>
@@ -604,6 +609,8 @@ let dragHandle = null;
 function openCrop(page, isNew) {
   state.pending = { page, isNew };
   setAutoBtnMode('auto');
+  // Reflect book mode in the toggle button when re-opening an existing page.
+  $('btn-book').classList.toggle('toggled', isBookMode(page));
   cropImg.onload = () => {
     const rect = cropImg.getBoundingClientRect();
     displayScale = rect.width / page.srcW;
@@ -632,6 +639,41 @@ function defaultCorners(w, h) {
   ];
 }
 
+// Book mode: 6 corners in clockwise order — TL, TM, TR, BR, BM, BL.
+// TM/BM mark the spine where the page meets the binding. A slight curl
+// is added by default so the curve fitting has something to work with;
+// the user can drag the spine handles to match the actual curve.
+function defaultBookCorners(w, h) {
+  const m = 0.05;
+  const xL = w*m, xR = w*(1-m), xC = w/2;
+  const yT = h*m, yB = h*(1-m);
+  const curlY = h * 0.04; // page curves up at the spine
+  return [
+    [xL, yT],            // 0: TL
+    [xC, yT + curlY],    // 1: TM (spine top)
+    [xR, yT],            // 2: TR
+    [xR, yB],            // 3: BR
+    [xC, yB - curlY],    // 4: BM (spine bottom)
+    [xL, yB],            // 5: BL
+  ];
+}
+
+// Quadratic Bezier whose curve passes through p0 at t=0, M at t=0.5, p2 at t=1.
+function bezPassThrough(p0, M, p2, t) {
+  // Control point so the curve actually interpolates the midpoint M.
+  const cx = 2*M[0] - 0.5*(p0[0] + p2[0]);
+  const cy = 2*M[1] - 0.5*(p0[1] + p2[1]);
+  const it = 1 - t;
+  return [
+    it*it*p0[0] + 2*it*t*cx + t*t*p2[0],
+    it*it*p0[1] + 2*it*t*cy + t*t*p2[1],
+  ];
+}
+function bezControl(p0, M, p2) {
+  return [2*M[0] - 0.5*(p0[0] + p2[0]), 2*M[1] - 0.5*(p0[1] + p2[1])];
+}
+function isBookMode(p) { return p && p.corners && p.corners.length === 6; }
+
 // Rebuild the SVG only when the number of handles changes. During drags we
 // just mutate cx/cy/points in place — rewriting innerHTML on every pointermove
 // destroys the element holding pointer capture, which is what was causing the
@@ -640,28 +682,63 @@ function defaultCorners(w, h) {
 // let the user drag a whole side at once. We only rewrite innerHTML when the
 // handle set changes; during a drag we mutate attributes in place so the
 // element holding pointer capture is not destroyed.
+// Build an SVG path describing the crop outline. In book mode (6 points)
+// the top edge (TL→TM→TR) and bottom edge (BR→BM→BL) are drawn as
+// quadratic Bezier curves that pass through the spine handles; the side
+// edges and the spine line are straight.
+function buildCropPath(pts, bookMode) {
+  if (!bookMode) {
+    return 'M ' + pts.map(p => p.join(',')).join(' L ') + ' Z';
+  }
+  const [TL, TM, TR, BR, BM, BL] = pts;
+  const cTop = bezControl(TL, TM, TR);
+  const cBot = bezControl(BR, BM, BL);
+  return `M ${TL[0]},${TL[1]}
+          Q ${cTop[0]},${cTop[1]} ${TR[0]},${TR[1]}
+          L ${BR[0]},${BR[1]}
+          Q ${cBot[0]},${cBot[1]} ${BL[0]},${BL[1]} Z`;
+}
+function buildSpinePath(pts) {
+  const [, TM, , , BM] = pts;
+  return `M ${TM[0]},${TM[1]} L ${BM[0]},${BM[1]}`;
+}
+
 function drawCorners() {
   const p = state.pending.page;
+  const bookMode = isBookMode(p);
+  const n = p.corners.length;
   const pts = p.corners.map(([x,y]) => [x*displayScale, y*displayScale]);
+  // Edge midpoint handles between each consecutive pair (n edges).
   const mids = pts.map((pt, i) => {
-    const next = pts[(i+1)%4];
+    const next = pts[(i+1)%n];
     return [(pt[0]+next[0])/2, (pt[1]+next[1])/2];
   });
-  const cornerHandles = cropSvg.querySelectorAll('.crop-handle.corner');
-  const edgeHandles = cropSvg.querySelectorAll('.crop-handle.edge');
-  let poly = cropSvg.querySelector('.crop-line');
-  if (cornerHandles.length !== 4 || edgeHandles.length !== 4 || !poly) {
+  const cornerHandles = cropSvg.querySelectorAll('.crop-handle[data-type="corner"]');
+  const edgeHandles = cropSvg.querySelectorAll('.crop-handle[data-type="edge"]');
+  const path = cropSvg.querySelector('path.crop-line');
+  const spine = cropSvg.querySelector('path.crop-spine');
+  // We rebuild the SVG whenever the number of handles changes (e.g. when
+  // toggling book mode on/off) or when going from polygon ↔ path.
+  if (cornerHandles.length !== n || edgeHandles.length !== n || !path
+      || (bookMode && !spine) || (!bookMode && spine)) {
+    const isSpineIdx = (i) => bookMode && (i === 1 || i === 4);
     cropSvg.innerHTML = `
-      <polygon class="crop-line" points="${pts.map(pt=>pt.join(',')).join(' ')}"/>
+      <path class="crop-line" d="${buildCropPath(pts, bookMode)}"/>
+      ${bookMode ? `<path class="crop-spine" d="${buildSpinePath(pts)}"/>` : ''}
       ${mids.map((pt,i)=>`<circle class="crop-handle edge" data-type="edge" data-i="${i}" cx="${pt[0]}" cy="${pt[1]}" r="12"></circle>`).join('')}
-      ${pts.map((pt,i)=>`<circle class="crop-handle corner" data-type="corner" data-i="${i}" cx="${pt[0]}" cy="${pt[1]}" r="16"></circle>`).join('')}
+      ${pts.map((pt,i)=>`<circle class="crop-handle ${isSpineIdx(i)?'spine':'corner'}" data-type="corner" data-i="${i}" cx="${pt[0]}" cy="${pt[1]}" r="16"></circle>`).join('')}
     `;
     cropSvg.querySelectorAll('.crop-handle').forEach(h => {
       h.addEventListener('pointerdown', onHandleDown);
     });
   } else {
-    poly.setAttribute('points', pts.map(pt=>pt.join(',')).join(' '));
-    cornerHandles.forEach((h, i) => { h.setAttribute('cx', pts[i][0]); h.setAttribute('cy', pts[i][1]); });
+    path.setAttribute('d', buildCropPath(pts, bookMode));
+    if (spine) spine.setAttribute('d', buildSpinePath(pts));
+    cornerHandles.forEach(h => {
+      const idx = parseInt(h.dataset.i, 10);
+      h.setAttribute('cx', pts[idx][0]);
+      h.setAttribute('cy', pts[idx][1]);
+    });
     edgeHandles.forEach((h, i) => { h.setAttribute('cx', mids[i][0]); h.setAttribute('cy', mids[i][1]); });
   }
 }
@@ -723,7 +800,8 @@ function onHandleMove(e) {
       // Translate the two corners sharing this edge by the same delta.
       let dx = px - dragStartPointer[0];
       let dy = py - dragStartPointer[1];
-      const i0 = dragIndex, i1 = (dragIndex + 1) % 4;
+      const n = p.corners.length;
+      const i0 = dragIndex, i1 = (dragIndex + 1) % n;
       const a0 = dragStartCorners[i0], a1 = dragStartCorners[i1];
       // Clamp delta so neither corner leaves the image.
       const minDx = Math.max(-a0[0], -a1[0]);
@@ -776,7 +854,54 @@ $('btn-undo').onclick = () => {
 $('btn-reset').onclick = () => {
   pushHistory();
   const p = state.pending.page;
-  p.corners = [[0,0],[p.srcW,0],[p.srcW,p.srcH],[0,p.srcH]];
+  if (isBookMode(p)) {
+    const w = p.srcW, h = p.srcH;
+    const curl = h * 0.04;
+    p.corners = [
+      [0, 0], [w/2, curl], [w, 0],
+      [w, h], [w/2, h - curl], [0, h],
+    ];
+  } else {
+    p.corners = [[0,0],[p.srcW,0],[p.srcW,p.srcH],[0,p.srcH]];
+  }
+  drawCorners();
+};
+
+// 책 mode toggle: switch between a 4-point rectangle and a 6-point book
+// outline (two pages joined at a curved spine). On the way in, place the
+// spine handles at the horizontal midpoint with a small default curl so
+// the curve fitting has something to start from.
+$('btn-book').onclick = () => {
+  pushHistory();
+  const p = state.pending.page;
+  const btn = $('btn-book');
+  if (isBookMode(p)) {
+    // Collapse back to a 4-point rectangle using the outer corners.
+    const [TL, , TR, BR, , BL] = p.corners;
+    p.corners = [TL, TR, BR, BL];
+    btn.classList.remove('toggled');
+    toast('일반 모드로 전환');
+  } else {
+    // Upgrade current 4 corners to 6 by inserting spine top/bottom at the
+    // midpoints of the top and bottom edges with a small curl bias.
+    const [TL, TR, BR, BL] = p.corners;
+    const topMidX = (TL[0] + TR[0]) / 2;
+    const topMidY = (TL[1] + TR[1]) / 2;
+    const botMidX = (BL[0] + BR[0]) / 2;
+    const botMidY = (BL[1] + BR[1]) / 2;
+    const sideH = Math.hypot(BL[0]-TL[0], BL[1]-TL[1]);
+    const curl = sideH * 0.04;
+    p.corners = [
+      TL,
+      [topMidX, topMidY + curl],
+      TR,
+      BR,
+      [botMidX, botMidY - curl],
+      BL,
+    ];
+    btn.classList.add('toggled');
+    toast('책 모드: 가운데 주황 점으로 책 곡선을 맞춰 주세요');
+  }
   drawCorners();
 };
 // The 자동 button toggles between "자동" (run edge detection) and
@@ -794,23 +919,40 @@ function setAutoBtnMode(mode) {
     btn.classList.add('toggled');
   }
 }
+// If a 4-corner result needs to fit a 6-point book outline, insert
+// spine top/bottom at the midpoint of the top/bottom edges with a small
+// curl bias so the curve fitting starts from a reasonable shape.
+function fourToBook(c, srcH) {
+  const [TL, TR, BR, BL] = c;
+  const curl = Math.hypot(BL[0]-TL[0], BL[1]-TL[1]) * 0.04;
+  return [
+    TL,
+    [(TL[0]+TR[0])/2, (TL[1]+TR[1])/2 + curl],
+    TR,
+    BR,
+    [(BL[0]+BR[0])/2, (BL[1]+BR[1])/2 - curl],
+    BL,
+  ];
+}
+
 $('btn-auto').onclick = async () => {
   pushHistory();
   const p = state.pending.page;
+  const wantBook = isBookMode(p);
   if (autoBtnMode === 'auto') {
     loader(true, '인식 중…');
     let c = null;
     try { c = await autoDetect(); } finally { loader(false); }
     if (c) {
-      p.corners = c;
+      p.corners = wantBook ? fourToBook(c, p.srcH) : c;
       toast('자동 인식 완료');
     } else {
-      p.corners = defaultCorners(p.srcW, p.srcH);
+      p.corners = wantBook ? defaultBookCorners(p.srcW, p.srcH) : defaultCorners(p.srcW, p.srcH);
       toast('자동 인식 실패 — 직접 조정해 주세요');
     }
     setAutoBtnMode('manual');
   } else {
-    p.corners = defaultCorners(p.srcW, p.srcH);
+    p.corners = wantBook ? defaultBookCorners(p.srcW, p.srcH) : defaultCorners(p.srcW, p.srcH);
     toast('수동 조정 모드');
     setAutoBtnMode('auto');
   }
@@ -865,18 +1007,41 @@ $('btn-crop-back').onclick = () => {
 };
 
 // Commit the current crop to state.pages. Returns true on success.
+// In book mode, the curved book outline is split into two flat pages
+// (left & right) using the curve-aware dewarp; both are appended.
 async function commitCurrentCrop() {
   const p = state.pending && state.pending.page;
   if (!p) return false;
-  loader(true, '자르는 중…');
+  loader(true, isBookMode(p) ? '책 펼치는 중…' : '자르는 중…');
   try {
-    const out = await warpCrop(p);
-    p.dataUrl = out;
-    if (state.pending.isNew) {
-      state.pages.push(p);
+    if (isBookMode(p)) {
+      const [leftUrl, rightUrl] = await warpBookSplit(p);
+      // Build two child pages preserving the original source.
+      const mk = (suffix, dataUrl) => ({
+        id: p.id + '-' + suffix + '-' + Math.random().toString(36).slice(2,5),
+        srcDataUrl: p.srcDataUrl, srcW: p.srcW, srcH: p.srcH,
+        corners: null, rotation: p.rotation, history: [],
+        dataUrl,
+      });
+      const leftPage = mk('L', leftUrl);
+      const rightPage = mk('R', rightUrl);
+      if (state.pending.isNew) {
+        state.pages.push(leftPage, rightPage);
+      } else {
+        // Replace the original entry with the two new ones.
+        const idx = state.pages.findIndex(x => x.id === p.id);
+        if (idx >= 0) state.pages.splice(idx, 1, leftPage, rightPage);
+        else state.pages.push(leftPage, rightPage);
+      }
     } else {
-      const idx = state.pages.findIndex(x => x.id === p.id);
-      if (idx >= 0) state.pages[idx] = p;
+      const out = await warpCrop(p);
+      p.dataUrl = out;
+      if (state.pending.isNew) {
+        state.pages.push(p);
+      } else {
+        const idx = state.pages.findIndex(x => x.id === p.id);
+        if (idx >= 0) state.pages[idx] = p;
+      }
     }
     state.pending = null;
     refreshPagesUI();
@@ -887,6 +1052,114 @@ async function commitCurrentCrop() {
     loader(false);
     toast('자르기 실패: ' + e.message, 2500);
     return false;
+  }
+}
+
+/* ---------- Book curve dewarp ----------
+   Inputs: page.corners is 6 points [TL, TM, TR, BR, BM, BL].
+   We model the top edge of the open book as a quadratic Bezier that
+   passes through (TL, TM, TR) and the bottom edge as one through
+   (BR, BM, BL). For each half-page, every output column maps to a
+   curve parameter t and we linearly interpolate between the top and
+   bottom curves at that t to find the source-image sample point.
+   This straightens the page-curl into a flat rectangle. */
+async function warpBookSplit(page) {
+  const img = new Image();
+  await new Promise((res, rej) => { img.onload = res; img.onerror = rej; img.src = page.srcDataUrl; });
+  const c = document.createElement('canvas');
+  c.width = img.width; c.height = img.height;
+  c.getContext('2d').drawImage(img, 0, 0);
+
+  if (!state.cvReady || typeof cv === 'undefined') {
+    throw new Error('이미지 처리 라이브러리 로딩이 필요합니다');
+  }
+  const src = cv.imread(c);
+  try {
+    const [TL, TM, TR, BR, BM, BL] = page.corners;
+
+    // Output dimensions: width per page from the corner-to-spine distance,
+    // height from the average side length.
+    const dist = (a,b) => Math.hypot(a[0]-b[0], a[1]-b[1]);
+    const leftW  = Math.round(Math.max(dist(TL,TM), dist(BL,BM)));
+    const rightW = Math.round(Math.max(dist(TR,TM), dist(BR,BM)));
+    const outH   = Math.round(Math.max(dist(TL,BL), dist(TM,BM), dist(TR,BR)));
+
+    // Cap output to keep the remap fast on phones.
+    const MAX_DIM = 2400;
+    const scale = Math.min(1, MAX_DIM / Math.max(leftW, rightW, outH));
+    const lW = Math.max(8, Math.round(leftW  * scale));
+    const rW = Math.max(8, Math.round(rightW * scale));
+    const oH = Math.max(8, Math.round(outH   * scale));
+
+    const leftUrl  = await remapPage(src, TL, TM, TR, BR, BM, BL, lW, oH, 'left');
+    const rightUrl = await remapPage(src, TL, TM, TR, BR, BM, BL, rW, oH, 'right');
+    return [leftUrl, rightUrl];
+  } finally {
+    src.delete();
+  }
+}
+
+// Render one half-page using cv.remap with maps computed from the
+// quadratic Bezier curves fitted to the top and bottom edges.
+async function remapPage(src, TL, TM, TR, BR, BM, BL, outW, outH, side) {
+  // Half of the bezier parameter belongs to each page.
+  // Left page uses t ∈ [0, 0.5], right page t ∈ [0.5, 1.0].
+  const tStart = side === 'left' ? 0 : 0.5;
+  const tSpan  = 0.5;
+
+  const cTopX = 2*TM[0] - 0.5*(TL[0] + TR[0]);
+  const cTopY = 2*TM[1] - 0.5*(TL[1] + TR[1]);
+  // Bottom curve goes BR → BM → BL (clockwise), so its endpoints are BR, BL.
+  const cBotX = 2*BM[0] - 0.5*(BR[0] + BL[0]);
+  const cBotY = 2*BM[1] - 0.5*(BR[1] + BL[1]);
+
+  const mxArr = new Float32Array(outW * outH);
+  const myArr = new Float32Array(outW * outH);
+
+  for (let oy = 0; oy < outH; oy++) {
+    const v = outH === 1 ? 0 : oy / (outH - 1);
+    for (let ox = 0; ox < outW; ox++) {
+      const u = outW === 1 ? 0 : ox / (outW - 1);
+      const t = tStart + u * tSpan;
+      const it = 1 - t;
+      // top point on the curve at param t
+      const topX = it*it*TL[0] + 2*it*t*cTopX + t*t*TR[0];
+      const topY = it*it*TL[1] + 2*it*t*cTopY + t*t*TR[1];
+      // bottom curve was BR→BL, so swap endpoints accordingly.
+      // We want u=0 → BL (left edge bottom) and u=1 → BR (right edge bottom)
+      // i.e. t' for bottom such that t'=0 corresponds to BL... but we already
+      // built cBot from (BR, BM, BL), where t=0 is BR. So to align with the
+      // top (which goes TL→TR as t grows), invert: use (1 - t) on bottom.
+      const tb = 1 - t;
+      const itb = 1 - tb;
+      const botX = itb*itb*BR[0] + 2*itb*tb*cBotX + tb*tb*BL[0];
+      const botY = itb*itb*BR[1] + 2*itb*tb*cBotY + tb*tb*BL[1];
+
+      const sx = (1 - v) * topX + v * botX;
+      const sy = (1 - v) * topY + v * botY;
+      const off = oy * outW + ox;
+      mxArr[off] = sx;
+      myArr[off] = sy;
+    }
+    if (oy % 64 === 0) {
+      // Yield to the UI thread occasionally so the loader stays responsive.
+      await new Promise(r => setTimeout(r, 0));
+    }
+  }
+
+  const mapX = new cv.Mat(outH, outW, cv.CV_32FC1);
+  const mapY = new cv.Mat(outH, outW, cv.CV_32FC1);
+  const dst = new cv.Mat();
+  try {
+    mapX.data32F.set(mxArr);
+    mapY.data32F.set(myArr);
+    cv.remap(src, dst, mapX, mapY, cv.INTER_LINEAR, cv.BORDER_REPLICATE);
+    const outCanvas = document.createElement('canvas');
+    outCanvas.width = outW; outCanvas.height = outH;
+    cv.imshow(outCanvas, dst);
+    return outCanvas.toDataURL('image/jpeg', 0.96);
+  } finally {
+    mapX.delete(); mapY.delete(); dst.delete();
   }
 }
 
