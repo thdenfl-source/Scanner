@@ -310,13 +310,21 @@
       <span class="ico">📄</span>
       <div class="col"><strong>PDF</strong><span class="desc">모든 페이지를 한 파일로</span></div>
     </button>
-    <button class="opt" data-fmt="jpg">
+    <button class="opt" data-fmt="jpg" data-mode="single">
       <span class="ico">🖼️</span>
-      <div class="col"><strong>JPG (ZIP)</strong><span class="desc">개별 이미지, 용량 작음</span></div>
+      <div class="col"><strong>JPG (개별 저장)</strong><span class="desc">갤러리에서 바로 보기, 한 장씩 저장</span></div>
     </button>
-    <button class="opt" data-fmt="png">
+    <button class="opt" data-fmt="jpg" data-mode="zip">
+      <span class="ico">🗜️</span>
+      <div class="col"><strong>JPG (ZIP 압축)</strong><span class="desc">여러 장을 한 파일로 묶어 저장</span></div>
+    </button>
+    <button class="opt" data-fmt="png" data-mode="single">
       <span class="ico">🖼️</span>
-      <div class="col"><strong>PNG (ZIP)</strong><span class="desc">개별 이미지, 무손실</span></div>
+      <div class="col"><strong>PNG (개별 저장)</strong><span class="desc">갤러리에서 바로 보기, 무손실</span></div>
+    </button>
+    <button class="opt" data-fmt="png" data-mode="zip">
+      <span class="ico">🗜️</span>
+      <div class="col"><strong>PNG (ZIP 압축)</strong><span class="desc">무손실 이미지를 한 파일로 묶어 저장</span></div>
     </button>
     <button class="cancel" id="btn-export-cancel">취소</button>
   </div>
@@ -1173,15 +1181,51 @@ $('btn-export-cancel').onclick = () => $('modal-export').classList.remove('activ
 document.querySelectorAll('#modal-export .opt').forEach(b => {
   b.onclick = () => {
     const fmt = b.dataset.fmt;
+    const mode = b.dataset.mode || (fmt === 'pdf' ? 'pdf' : 'zip');
     $('modal-export').classList.remove('active');
-    exportAs(fmt);
+    exportAs(fmt, mode);
   };
 });
 
-async function exportAs(fmt) {
+// Re-encode a page's cached JPEG dataUrl to the requested format/quality
+// and return a Blob suitable for download / share.
+async function pageToBlob(page, fmt) {
+  if (fmt === 'jpg' || fmt === 'jpeg') {
+    // The cached dataUrl is already JPEG ~0.96; just convert it to a Blob.
+    const res = await fetch(page.dataUrl);
+    return await res.blob();
+  }
+  // PNG: re-encode from pixels (lossless).
+  const img = new Image();
+  await new Promise(r => { img.onload = r; img.src = page.dataUrl; });
+  const c = document.createElement('canvas');
+  c.width = img.width; c.height = img.height;
+  c.getContext('2d').drawImage(img, 0, 0);
+  return await new Promise(res => c.toBlob(res, 'image/png'));
+}
+
+// Save a single Blob to the user's device. On supporting mobile browsers
+// we use the Web Share API with files so the user can save straight to
+// Photos / Gallery; otherwise we trigger an <a download> click.
+async function saveBlob(blob, filename) {
+  if (navigator.canShare && navigator.canShare({ files: [new File([blob], filename, { type: blob.type })] })) {
+    try {
+      await navigator.share({ files: [new File([blob], filename, { type: blob.type })], title: filename });
+      return;
+    } catch (_) { /* user cancelled or unsupported — fall through */ }
+  }
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+
+async function exportAs(fmt, mode) {
   loader(true, '저장 파일 생성 중…');
   try {
     const stamp = new Date().toISOString().replace(/[:.]/g,'-').slice(0,19);
+
     if (fmt === 'pdf') {
       const { jsPDF } = window.jspdf;
       const pdf = new jsPDF({ unit: 'pt', format: 'a4' });
@@ -1198,15 +1242,37 @@ async function exportAs(fmt) {
         pdf.addImage(p.dataUrl, 'JPEG', x, y, w, h);
       }
       pdf.save(`docscan-${stamp}.pdf`);
+    } else if (mode === 'single') {
+      // Save each page as its own file so it lands in the gallery /
+      // Downloads folder directly — no ZIP step.
+      const ext = fmt;
+      // Multi-file share in one call if supported; otherwise download one
+      // by one with a small delay (most browsers throttle rapid downloads).
+      const files = [];
+      for (let i = 0; i < state.pages.length; i++) {
+        loader(true, `이미지 변환 중… (${i+1}/${state.pages.length})`);
+        const blob = await pageToBlob(state.pages[i], fmt);
+        files.push(new File([blob], `docscan-${stamp}-${String(i+1).padStart(3,'0')}.${ext}`,
+                            { type: blob.type }));
+      }
+      if (files.length > 1 && navigator.canShare && navigator.canShare({ files })) {
+        try {
+          await navigator.share({ files, title: `DocScan ${stamp}` });
+        } catch (_) {
+          // user cancelled — still fall back to downloads so nothing is lost
+          for (const f of files) { await saveBlob(f, f.name); await wait(250); }
+        }
+      } else {
+        for (const f of files) { await saveBlob(f, f.name); await wait(250); }
+      }
     } else {
+      // ZIP mode
       const zip = new JSZip();
-      const mime = fmt === 'png' ? 'image/png' : 'image/jpeg';
       const ext = fmt;
       for (let i = 0; i < state.pages.length; i++) {
         const p = state.pages[i];
         let dataUrl = p.dataUrl;
         if (fmt === 'png') {
-          // Re-encode as PNG
           const img = new Image();
           await new Promise(r => { img.onload = r; img.src = p.dataUrl; });
           const c = document.createElement('canvas');
@@ -1218,11 +1284,7 @@ async function exportAs(fmt) {
         zip.file(`page-${String(i+1).padStart(3,'0')}.${ext}`, b64, { base64: true });
       }
       const blob = await zip.generateAsync({ type: 'blob' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url; a.download = `docscan-${stamp}-${fmt}.zip`;
-      a.click();
-      setTimeout(()=>URL.revokeObjectURL(url), 1000);
+      await saveBlob(blob, `docscan-${stamp}-${fmt}.zip`);
     }
     loader(false);
     toast('저장 완료');
@@ -1235,6 +1297,8 @@ async function exportAs(fmt) {
     toast('저장 실패: ' + e.message, 3000);
   }
 }
+
+function wait(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 /* ---------- Quit ---------- */
 $('btn-close-cam').onclick = () => {
