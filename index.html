@@ -115,7 +115,9 @@
   .crop-handle {
     fill: #4ea1ff; stroke: #fff; stroke-width: 2;
     cursor: grab;
+    touch-action: none;
   }
+  #crop-svg { touch-action: none; }
   .crop-line { stroke: #4ea1ff; stroke-width: 2; fill: rgba(78,161,255,0.12); }
   .crop-bottom {
     height: 96px; flex-shrink: 0;
@@ -448,42 +450,89 @@ function defaultCorners(w, h) {
   ];
 }
 
+// Rebuild the SVG only when the number of handles changes. During drags we
+// just mutate cx/cy/points in place — rewriting innerHTML on every pointermove
+// destroys the element holding pointer capture, which is what was causing the
+// drag to feel choppy / "stuck".
 function drawCorners() {
   const p = state.pending.page;
   const pts = p.corners.map(([x,y]) => [x*displayScale, y*displayScale]);
-  const poly = pts.map(p=>p.join(',')).join(' ');
-  cropSvg.innerHTML = `
-    <polygon class="crop-line" points="${poly}"/>
-    ${pts.map((pt,i)=>`<circle class="crop-handle" data-i="${i}" cx="${pt[0]}" cy="${pt[1]}" r="14"></circle>`).join('')}
-  `;
-  cropSvg.querySelectorAll('.crop-handle').forEach(h => {
-    h.addEventListener('pointerdown', onHandleDown);
-  });
+  const handles = cropSvg.querySelectorAll('.crop-handle');
+  let poly = cropSvg.querySelector('.crop-line');
+  if (handles.length !== pts.length || !poly) {
+    cropSvg.innerHTML = `
+      <polygon class="crop-line" points="${pts.map(pt=>pt.join(',')).join(' ')}"/>
+      ${pts.map((pt,i)=>`<circle class="crop-handle" data-i="${i}" cx="${pt[0]}" cy="${pt[1]}" r="16"></circle>`).join('')}
+    `;
+    cropSvg.querySelectorAll('.crop-handle').forEach(h => {
+      h.addEventListener('pointerdown', onHandleDown);
+    });
+  } else {
+    poly.setAttribute('points', pts.map(pt=>pt.join(',')).join(' '));
+    handles.forEach((h, i) => {
+      h.setAttribute('cx', pts[i][0]);
+      h.setAttribute('cy', pts[i][1]);
+    });
+  }
 }
+
+let dragPointerId = null;
+let dragOffset = [0, 0]; // pointer offset from corner center, in source coords
+let dragRaf = 0;
+let dragLastEvent = null;
 
 function onHandleDown(e) {
   e.preventDefault();
-  dragHandle = parseInt(e.target.dataset.i, 10);
-  e.target.setPointerCapture(e.pointerId);
-  e.target.addEventListener('pointermove', onHandleMove);
-  e.target.addEventListener('pointerup', onHandleUp, { once: true });
+  dragHandle = parseInt(e.currentTarget.dataset.i, 10);
+  dragPointerId = e.pointerId;
+  const rect = cropImg.getBoundingClientRect();
+  const px = (e.clientX - rect.left) / displayScale;
+  const py = (e.clientY - rect.top) / displayScale;
+  const [cx, cy] = state.pending.page.corners[dragHandle];
+  // Lock to the offset between finger and corner center so the corner doesn't
+  // "snap" to the finger on touchdown.
+  dragOffset = [cx - px, cy - py];
+  try { e.currentTarget.setPointerCapture(e.pointerId); } catch (_) {}
+  // Listen on window so we keep tracking even if the pointer leaves the SVG
+  // or if we end up re-rendering the captured element.
+  window.addEventListener('pointermove', onHandleMove, { passive: false });
+  window.addEventListener('pointerup', onHandleUp);
+  window.addEventListener('pointercancel', onHandleUp);
   // Push history snapshot before moving
   pushHistory();
 }
+
 function onHandleMove(e) {
   if (dragHandle == null) return;
-  const rect = cropImg.getBoundingClientRect();
-  const x = (e.clientX - rect.left) / displayScale;
-  const y = (e.clientY - rect.top) / displayScale;
-  const p = state.pending.page;
-  p.corners[dragHandle] = [
-    Math.max(0, Math.min(p.srcW, x)),
-    Math.max(0, Math.min(p.srcH, y))
-  ];
-  drawCorners();
+  if (dragPointerId != null && e.pointerId !== dragPointerId) return;
+  e.preventDefault();
+  dragLastEvent = e;
+  if (dragRaf) return;
+  dragRaf = requestAnimationFrame(() => {
+    dragRaf = 0;
+    const ev = dragLastEvent;
+    if (!ev || dragHandle == null) return;
+    const rect = cropImg.getBoundingClientRect();
+    const x = (ev.clientX - rect.left) / displayScale + dragOffset[0];
+    const y = (ev.clientY - rect.top) / displayScale + dragOffset[1];
+    const p = state.pending.page;
+    p.corners[dragHandle] = [
+      Math.max(0, Math.min(p.srcW, x)),
+      Math.max(0, Math.min(p.srcH, y))
+    ];
+    drawCorners();
+  });
 }
+
 function onHandleUp(e) {
+  if (dragPointerId != null && e && e.pointerId !== dragPointerId) return;
   dragHandle = null;
+  dragPointerId = null;
+  if (dragRaf) { cancelAnimationFrame(dragRaf); dragRaf = 0; }
+  dragLastEvent = null;
+  window.removeEventListener('pointermove', onHandleMove);
+  window.removeEventListener('pointerup', onHandleUp);
+  window.removeEventListener('pointercancel', onHandleUp);
 }
 
 function pushHistory() {
