@@ -322,25 +322,12 @@
   }
   @keyframes spin { to { transform: rotate(360deg); } }
 
-  /* ----------------------------------------------------------------
-     Orientation lock: keep the interface size and button positions
-     identical regardless of how the device is held. When the device
-     is landscape we rotate the entire app -90° so the layout stays
-     in its portrait form and the text inside reads upright for the
-     user holding the device sideways. The video preview and crop
-     SVG ride along with the rotation, so pointer events keep working
-     unchanged. ---------------------------------------------------- */
-  @media (orientation: landscape) {
-    html { overflow: hidden; }
-    body {
-      position: fixed;
-      top: 0; left: 0;
-      width: 100vh;
-      height: 100vw;
-      transform-origin: top left;
-      transform: rotate(-90deg) translateX(-100%);
-    }
-  }
+  /* The UI lays out naturally in whichever orientation the device is
+     in, so text always reads upright — landscape device shows
+     landscape-aligned text, portrait shows portrait-aligned text.
+     (Earlier we rotated body -90° to force a portrait layout in
+     landscape, which kept button positions identical but made every
+     label read sideways. Reverted in favour of normal text flow.) */
 
   .empty {
     flex: 1; display: flex; align-items: center; justify-content: center;
@@ -1141,43 +1128,13 @@ let dragLastEvent = null;
 // displayScale. Without this the drag direction is wrong when the
 // device viewport and the photo's aspect disagree on iPad.
 // Map viewport coords (clientX, clientY from a pointer event) into the
-// source image's pixel coordinate system. We do the inverse of our
-// orientation-lock body rotation by hand instead of relying on
-// SVG.getScreenCTM() — Safari / iPadOS don't include ancestor CSS
-// transforms in the CTM of an inline SVG, which is what was breaking
-// the drag direction on iPad.
-//
-// The CSS in @media (orientation: landscape) is
-//     transform: rotate(-90deg) translateX(-100%);
-// applied with transform-origin: top left. Multiplying those out
-// gives the forward map for a body-local point (x, y):
-//     viewport = (y, W_body - x),   W_body = 100vh = innerHeight
-// so the inverse is (clientX, clientY) → (W_body - clientY, clientX).
-function isLayoutRotated() {
-  return !!(window.matchMedia &&
-            window.matchMedia('(orientation: landscape)').matches);
-}
-function clientToBodyLocal(clientX, clientY) {
-  if (isLayoutRotated()) {
-    return [window.innerHeight - clientY, clientX];
-  }
-  return [clientX, clientY];
-}
-function imageOffsetInBody() {
-  // Walk the offsetParent chain so we get a pre-CSS-transform position
-  // of cropImg's top-left within the body's local coordinate system.
-  let x = 0, y = 0, el = cropImg;
-  while (el && el !== document.body) {
-    x += el.offsetLeft || 0;
-    y += el.offsetTop  || 0;
-    el = el.offsetParent;
-  }
-  return [x, y];
-}
+// source image's pixel coordinate system. With the body rotation
+// removed there is no CSS transform to undo — we just use cropImg's
+// bounding box directly. Kept as a helper so any future rotation /
+// scale fix lands in one place.
 function clientToImage(clientX, clientY) {
-  const [bx, by] = clientToBodyLocal(clientX, clientY);
-  const [ox, oy] = imageOffsetInBody();
-  return [(bx - ox) / displayScale, (by - oy) / displayScale];
+  const rect = cropImg.getBoundingClientRect();
+  return [(clientX - rect.left) / displayScale, (clientY - rect.top) / displayScale];
 }
 
 function onHandleDown(e) {
