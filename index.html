@@ -108,6 +108,16 @@
     position: relative;
   }
   #crop-img { display: block; max-width: 100%; max-height: 100%; }
+  /* Live descreen preview overlay. While monitor sliders are non-zero
+     we render the filtered image into this canvas and show it on top
+     of #crop-img. The SVG (handles) still draws above it. */
+  #crop-preview {
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    display: none;
+    pointer-events: none;
+  }
+  #crop-preview.active { display: block; }
   #crop-svg {
     position: absolute; inset: 0; width: 100%; height: 100%;
     overflow: visible;
@@ -190,6 +200,13 @@
     float: right;
   }
   .monitor-reset:active { background: rgba(78,161,255,0.15); }
+  #m-compare {
+    margin-right: 6px;
+    background: #4ea1ff; color: #fff; border-color: #4ea1ff;
+  }
+  #m-compare:active, #m-compare.held {
+    background: #2a78d4; border-color: #2a78d4;
+  }
   .crop-line { stroke: #4ea1ff; stroke-width: 2; fill: rgba(78,161,255,0.12); }
   .crop-bottom {
     height: 96px; flex-shrink: 0;
@@ -368,6 +385,7 @@
   <div id="crop-stage">
     <div id="crop-canvas-wrap">
       <img id="crop-img"/>
+      <canvas id="crop-preview"></canvas>
       <svg id="crop-svg"></svg>
     </div>
     <div id="magnifier"><canvas id="mag-canvas" width="180" height="180"></canvas></div>
@@ -388,6 +406,7 @@
         <span class="val" id="m-sharp-v">0</span>
       </div>
       <button class="monitor-reset" id="m-reset">0으로 초기화</button>
+      <button class="monitor-reset" id="m-compare">원본 비교 (누르고 있기)</button>
     </div>
   </div>
   <div class="crop-bottom">
@@ -719,12 +738,18 @@ function openCrop(page, isNew) {
   setMonitorBtn(page.descreen);
   syncMonitorPanel(page.descreen);
   openMonitorPanel(false);
+  // Drop the previous page's cached preview source — we'll rebuild
+  // from the new cropImg once it's loaded.
+  disposePreviewSrc();
+  $('crop-preview').classList.remove('active');
   cropImg.onload = () => {
     const rect = cropImg.getBoundingClientRect();
     displayScale = rect.width / page.srcW;
     cropSvg.setAttribute('width', rect.width);
     cropSvg.setAttribute('height', rect.height);
     cropSvg.setAttribute('viewBox', `0 0 ${rect.width} ${rect.height}`);
+    // If this page already has descreen values, paint the preview.
+    schedulePreview();
     if (!page.corners) {
       // Try auto-detect
       autoDetect().then(corners => {
@@ -1324,6 +1349,7 @@ function attachSlider(inputId, valId, key) {
     p.descreen = Object.assign({}, p.descreen || DESCREEN_DEFAULT, { [key]: v });
     if (!descreenIsActive(p.descreen)) p.descreen = null;
     setMonitorBtn(p.descreen);
+    schedulePreview();
   };
   input.addEventListener('input', onInput);
   input.addEventListener('change', onInput);
@@ -1337,7 +1363,111 @@ $('m-reset').onclick = () => {
   p.descreen = null;
   syncMonitorPanel(null);
   setMonitorBtn(null);
+  schedulePreview();
 };
+
+// "원본 비교" — press and hold to temporarily hide the descreen
+// preview overlay so the user can A/B against the original pixels.
+// The current slider values are preserved; releasing the button (or
+// dragging the pointer away) restores the filtered preview.
+let _compareHeld = false;
+function setCompareHeld(on) {
+  _compareHeld = !!on;
+  const btn = $('m-compare');
+  const canvas = $('crop-preview');
+  btn.classList.toggle('held', _compareHeld);
+  if (_compareHeld) {
+    canvas.classList.remove('active');
+    btn.textContent = '원본 (표시중)';
+  } else {
+    btn.textContent = '원본 비교 (누르고 있기)';
+    schedulePreview();
+  }
+}
+(function bindCompare() {
+  const btn = $('m-compare');
+  const down = (e) => {
+    e.preventDefault();
+    const p = state.pending && state.pending.page;
+    if (!p || !descreenIsActive(p.descreen)) {
+      toast('비교할 보정값이 없습니다');
+      return;
+    }
+    setCompareHeld(true);
+    try { btn.setPointerCapture(e.pointerId); } catch (_) {}
+  };
+  const up = () => { if (_compareHeld) setCompareHeld(false); };
+  btn.addEventListener('pointerdown', down);
+  btn.addEventListener('pointerup', up);
+  btn.addEventListener('pointercancel', up);
+  btn.addEventListener('pointerleave', up);
+})();
+
+/* ---------- Live descreen preview ----------
+   Slider changes were only affecting the *saved* output before, so the
+   user had to commit just to see what the filter did. We now keep a
+   downscaled cv.Mat copy of the current crop source and re-run the
+   descreen pipeline whenever a slider moves, painting the result into
+   #crop-preview which sits between cropImg and the SVG handles. */
+let _previewMat = null;
+let _previewSrcPageId = null;
+let _previewRaf = 0;
+
+function disposePreviewSrc() {
+  if (_previewMat) { try { _previewMat.delete(); } catch (_) {} _previewMat = null; }
+  _previewSrcPageId = null;
+}
+
+// Build (or rebuild) the downscaled source Mat we filter against. We cap
+// the longest side around 1280 px so each slider tweak is fast on phones.
+function ensurePreviewSrc() {
+  const p = state.pending && state.pending.page;
+  if (!p) return false;
+  if (_previewSrcPageId === p.id && _previewMat) return true;
+  disposePreviewSrc();
+  if (!state.cvReady || typeof cv === 'undefined') return false;
+  if (!cropImg.naturalWidth) return false;
+  const MAX = 1280;
+  const s = Math.min(1, MAX / Math.max(cropImg.naturalWidth, cropImg.naturalHeight));
+  const c = document.createElement('canvas');
+  c.width  = Math.max(1, Math.round(cropImg.naturalWidth  * s));
+  c.height = Math.max(1, Math.round(cropImg.naturalHeight * s));
+  c.getContext('2d').drawImage(cropImg, 0, 0, c.width, c.height);
+  try { _previewMat = cv.imread(c); }
+  catch (e) { console.warn('preview imread failed', e); return false; }
+  _previewSrcPageId = p.id;
+  return true;
+}
+
+function schedulePreview() {
+  if (_previewRaf) return;
+  _previewRaf = requestAnimationFrame(() => {
+    _previewRaf = 0;
+    runPreview();
+  });
+}
+
+function runPreview() {
+  const canvas = $('crop-preview');
+  const p = state.pending && state.pending.page;
+  if (!p || !descreenIsActive(p.descreen)) {
+    canvas.classList.remove('active');
+    return;
+  }
+  if (!ensurePreviewSrc()) return;
+  const dst = _previewMat.clone();
+  try {
+    applyDescreenInPlace(dst, p.descreen);
+    // cv.imshow sets canvas.width/height to the Mat dimensions; CSS
+    // (width/height: 100%) scales it to overlay cropImg precisely.
+    cv.imshow(canvas, dst);
+    canvas.classList.add('active');
+  } catch (e) {
+    console.warn('preview failed', e);
+  } finally {
+    dst.delete();
+  }
+}
 
 // Apply the descreen filter in place on an RGBA cv.Mat. Each cv.Mat is
 // tracked in `tmps` so the finally clause can free all of them no matter
