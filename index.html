@@ -355,8 +355,13 @@
   <div class="topbar">
     <button class="icon-btn" id="btn-close-cam" title="닫기">✕</button>
     <div class="title">DocScan</div>
-    <button class="icon-btn" id="btn-flip" title="카메라 전환">⟲</button>
+    <div style="display:flex; align-items:center;">
+      <button class="icon-btn" id="btn-gallery" title="갤러리에서 가져오기">🖼️</button>
+      <button class="icon-btn" id="btn-flip" title="카메라 전환">⟲</button>
+    </div>
   </div>
+  <input type="file" id="gallery-input" accept="image/*" multiple
+         style="display:none"/>
   <div id="cam-stage">
     <video id="video" autoplay playsinline muted></video>
     <svg id="live-overlay"></svg>
@@ -722,6 +727,90 @@ async function captureFrame() {
     dataUrl: null,
   }, /*isNew=*/true);
 }
+
+/* ---------- Gallery import ----------
+   Lets the user open photos that already exist on their device and run
+   them through the same crop / book / monitor / save pipeline as a fresh
+   capture. Multiple files: the first opens in the crop editor right
+   away; the rest are queued and surfaced sequentially as the user
+   commits each one. */
+const _galleryQueue = [];
+
+function decodeFileToCanvas(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error || new Error('파일 읽기 실패'));
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        const c = document.createElement('canvas');
+        // Honour the device's max sensor budget so giant gallery files
+        // don't blow up memory; still keeps plenty of resolution.
+        const MAX = 4096;
+        const s = Math.min(1, MAX / Math.max(img.naturalWidth, img.naturalHeight));
+        c.width  = Math.max(1, Math.round(img.naturalWidth  * s));
+        c.height = Math.max(1, Math.round(img.naturalHeight * s));
+        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+        resolve({ canvas: c, dataUrl: reader.result });
+      };
+      img.onerror = () => reject(new Error('이미지 디코딩 실패'));
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+async function openGalleryPage(file) {
+  loader(true, '이미지 불러오는 중…');
+  try {
+    const { canvas } = await decodeFileToCanvas(file);
+    // Re-encode at the (possibly downscaled) canvas size so srcW / srcH
+    // always match the bitmap we'll actually warp from.
+    const finalDataUrl = canvas.toDataURL('image/jpeg', CAPTURE_JPEG_QUALITY);
+    loader(false);
+    openCrop({
+      id: 'g' + Date.now() + Math.random().toString(36).slice(2,6),
+      srcDataUrl: finalDataUrl,
+      srcW: canvas.width, srcH: canvas.height,
+      corners: null, rotation: 0, history: [],
+      dataUrl: null,
+    }, /*isNew=*/true);
+  } catch (e) {
+    loader(false);
+    toast('불러오기 실패: ' + (e.message || e), 3000);
+  }
+}
+
+$('btn-gallery').onclick = () => {
+  const input = $('gallery-input');
+  input.value = '';
+  input.click();
+};
+
+$('gallery-input').addEventListener('change', async (e) => {
+  const files = Array.from(e.target.files || []);
+  if (!files.length) return;
+  // Queue the rest; first one opens immediately.
+  _galleryQueue.length = 0;
+  for (let i = 1; i < files.length; i++) _galleryQueue.push(files[i]);
+  await openGalleryPage(files[0]);
+});
+
+// Wrap commitCurrentCrop so the next queued gallery file opens
+// automatically after the previous one is saved.
+(function chainGalleryQueue() {
+  const orig = window.commitCurrentCrop || null;
+  if (!orig) return;
+  window.commitCurrentCrop = async function (...args) {
+    const result = await orig.apply(this, args);
+    if (result && _galleryQueue.length) {
+      const next = _galleryQueue.shift();
+      // Defer so the current "continue"/"finish" navigation completes first.
+      setTimeout(() => { openGalleryPage(next); }, 50);
+    }
+    return result;
+  };
+})();
 
 /* ---------- Crop view ---------- */
 let cropImg = $('crop-img');
