@@ -200,6 +200,13 @@
     float: right;
   }
   .monitor-reset:active { background: rgba(78,161,255,0.15); }
+  #m-compare {
+    margin-right: 6px;
+    background: #4ea1ff; color: #fff; border-color: #4ea1ff;
+  }
+  #m-compare:active, #m-compare.held {
+    background: #2a78d4; border-color: #2a78d4;
+  }
   .crop-line { stroke: #4ea1ff; stroke-width: 2; fill: rgba(78,161,255,0.12); }
   .crop-bottom {
     height: 96px; flex-shrink: 0;
@@ -399,6 +406,7 @@
         <span class="val" id="m-sharp-v">0</span>
       </div>
       <button class="monitor-reset" id="m-reset">0으로 초기화</button>
+      <button class="monitor-reset" id="m-compare">원본 비교 (누르고 있기)</button>
     </div>
   </div>
   <div class="crop-bottom">
@@ -1357,6 +1365,43 @@ $('m-reset').onclick = () => {
   setMonitorBtn(null);
   schedulePreview();
 };
+
+// "원본 비교" — press and hold to temporarily hide the descreen
+// preview overlay so the user can A/B against the original pixels.
+// The current slider values are preserved; releasing the button (or
+// dragging the pointer away) restores the filtered preview.
+let _compareHeld = false;
+function setCompareHeld(on) {
+  _compareHeld = !!on;
+  const btn = $('m-compare');
+  const canvas = $('crop-preview');
+  btn.classList.toggle('held', _compareHeld);
+  if (_compareHeld) {
+    canvas.classList.remove('active');
+    btn.textContent = '원본 (표시중)';
+  } else {
+    btn.textContent = '원본 비교 (누르고 있기)';
+    schedulePreview();
+  }
+}
+(function bindCompare() {
+  const btn = $('m-compare');
+  const down = (e) => {
+    e.preventDefault();
+    const p = state.pending && state.pending.page;
+    if (!p || !descreenIsActive(p.descreen)) {
+      toast('비교할 보정값이 없습니다');
+      return;
+    }
+    setCompareHeld(true);
+    try { btn.setPointerCapture(e.pointerId); } catch (_) {}
+  };
+  const up = () => { if (_compareHeld) setCompareHeld(false); };
+  btn.addEventListener('pointerdown', down);
+  btn.addEventListener('pointerup', up);
+  btn.addEventListener('pointercancel', up);
+  btn.addEventListener('pointerleave', up);
+})();
 
 /* ---------- Live descreen preview ----------
    Slider changes were only affecting the *saved* output before, so the
