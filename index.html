@@ -130,6 +130,23 @@
   }
   .crop-spine { stroke: #f5a623; stroke-width: 2; fill: none; stroke-dasharray: 6 4; }
   #crop-svg { touch-action: none; }
+  /* Loupe shown next to the dragging finger so the user can see the
+     pixel hidden under their fingertip. */
+  #magnifier {
+    position: absolute;
+    width: 180px; height: 180px;
+    border-radius: 50%;
+    border: 3px solid #4ea1ff;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+    overflow: hidden;
+    background: #000;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.12s, left 0.18s, right 0.18s, top 0.18s;
+    z-index: 50;
+  }
+  #magnifier.active { opacity: 1; }
+  #magnifier canvas { display: block; width: 100%; height: 100%; }
   .crop-line { stroke: #4ea1ff; stroke-width: 2; fill: rgba(78,161,255,0.12); }
   .crop-bottom {
     height: 96px; flex-shrink: 0;
@@ -310,6 +327,7 @@
       <img id="crop-img"/>
       <svg id="crop-svg"></svg>
     </div>
+    <div id="magnifier"><canvas id="mag-canvas" width="180" height="180"></canvas></div>
   </div>
   <div class="crop-bottom">
     <button id="btn-auto">⌖ 자동</button>
@@ -957,6 +975,7 @@ function onHandleDown(e) {
   window.addEventListener('pointerup', onHandleUp);
   window.addEventListener('pointercancel', onHandleUp);
   pushHistory();
+  showMagnifier(e.clientX, e.clientY);
 }
 
 function onHandleMove(e) {
@@ -996,6 +1015,7 @@ function onHandleMove(e) {
       p.corners[i1] = [a1[0] + dx, a1[1] + dy];
     }
     drawCorners();
+    updateMagnifier(ev.clientX, ev.clientY);
   });
 }
 
@@ -1012,6 +1032,80 @@ function onHandleUp(e) {
   window.removeEventListener('pointermove', onHandleMove);
   window.removeEventListener('pointerup', onHandleUp);
   window.removeEventListener('pointercancel', onHandleUp);
+  hideMagnifier();
+}
+
+/* ---------- Loupe / magnifier ----------
+   While dragging a corner or edge handle, the user's fingertip covers
+   the very point they're trying to place. We pop a small circular loupe
+   into a corner of the crop view that shows a 3× zoom around the active
+   point with a crosshair, so the user can see exactly where the handle
+   is landing under their finger. The loupe auto-flips to the opposite
+   side of the screen so it never sits where the finger is. */
+const MAG_ZOOM = 3;
+const _mag = (() => {
+  const el = $('magnifier');
+  const cv = $('mag-canvas');
+  const ctx = cv.getContext('2d');
+  return { el, cv, ctx };
+})();
+function showMagnifier(clientX, clientY) {
+  _mag.el.classList.add('active');
+  updateMagnifier(clientX, clientY);
+}
+function hideMagnifier() {
+  _mag.el.classList.remove('active');
+}
+function updateMagnifier(clientX, clientY) {
+  if (dragIndex == null) return;
+  const p = state.pending && state.pending.page;
+  if (!p || !p.corners[dragIndex]) return;
+  // Active point's position in source-image coords (where the handle
+  // now sits, not necessarily where the finger is).
+  let cx, cy;
+  if (dragType === 'edge') {
+    const n = p.corners.length;
+    const a = p.corners[dragIndex], b = p.corners[(dragIndex+1)%n];
+    cx = (a[0] + b[0]) / 2;
+    cy = (a[1] + b[1]) / 2;
+  } else {
+    cx = p.corners[dragIndex][0];
+    cy = p.corners[dragIndex][1];
+  }
+
+  const W = _mag.cv.width, H = _mag.cv.height;
+  const srcW = W / MAG_ZOOM, srcH = H / MAG_ZOOM;
+  const sx = cx - srcW / 2;
+  const sy = cy - srcH / 2;
+
+  const ctx = _mag.ctx;
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+  try {
+    ctx.drawImage(cropImg, sx, sy, srcW, srcH, 0, 0, W, H);
+  } catch (_) { /* image not ready yet — fall through */ }
+
+  // Crosshair
+  ctx.strokeStyle = '#4ea1ff';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(W/2 - 14, H/2); ctx.lineTo(W/2 + 14, H/2);
+  ctx.moveTo(W/2, H/2 - 14); ctx.lineTo(W/2, H/2 + 14);
+  ctx.stroke();
+  ctx.fillStyle = '#4ea1ff';
+  ctx.beginPath(); ctx.arc(W/2, H/2, 3, 0, Math.PI*2); ctx.fill();
+
+  // Position the loupe in the corner farthest from the finger so it
+  // never sits under the hand. Relative to #crop-stage.
+  const stage = $('crop-stage').getBoundingClientRect();
+  const fx = clientX - stage.left;
+  const fy = clientY - stage.top;
+  const onRight = fx < stage.width / 2;
+  const onBottom = fy < stage.height / 2;
+  _mag.el.style.left  = onRight  ? 'auto' : '12px';
+  _mag.el.style.right = onRight  ? '12px' : 'auto';
+  _mag.el.style.top   = onBottom ? 'auto' : '12px';
+  _mag.el.style.bottom= onBottom ? '12px' : 'auto';
 }
 
 function pushHistory() {
