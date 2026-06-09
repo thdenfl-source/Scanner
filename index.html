@@ -1140,17 +1140,44 @@ let dragLastEvent = null;
 // rotation in the orientation lock — are inverted before we divide by
 // displayScale. Without this the drag direction is wrong when the
 // device viewport and the photo's aspect disagree on iPad.
-function clientToImage(clientX, clientY) {
-  const ctm = cropSvg.getScreenCTM && cropSvg.getScreenCTM();
-  if (ctm) {
-    const pt = cropSvg.createSVGPoint();
-    pt.x = clientX; pt.y = clientY;
-    const local = pt.matrixTransform(ctm.inverse());
-    return [local.x / displayScale, local.y / displayScale];
+// Map viewport coords (clientX, clientY from a pointer event) into the
+// source image's pixel coordinate system. We do the inverse of our
+// orientation-lock body rotation by hand instead of relying on
+// SVG.getScreenCTM() — Safari / iPadOS don't include ancestor CSS
+// transforms in the CTM of an inline SVG, which is what was breaking
+// the drag direction on iPad.
+//
+// The CSS in @media (orientation: landscape) is
+//     transform: rotate(-90deg) translateX(-100%);
+// applied with transform-origin: top left. Multiplying those out
+// gives the forward map for a body-local point (x, y):
+//     viewport = (y, W_body - x),   W_body = 100vh = innerHeight
+// so the inverse is (clientX, clientY) → (W_body - clientY, clientX).
+function isLayoutRotated() {
+  return !!(window.matchMedia &&
+            window.matchMedia('(orientation: landscape)').matches);
+}
+function clientToBodyLocal(clientX, clientY) {
+  if (isLayoutRotated()) {
+    return [window.innerHeight - clientY, clientX];
   }
-  // Last-resort fallback for older engines.
-  const rect = cropImg.getBoundingClientRect();
-  return [(clientX - rect.left) / displayScale, (clientY - rect.top) / displayScale];
+  return [clientX, clientY];
+}
+function imageOffsetInBody() {
+  // Walk the offsetParent chain so we get a pre-CSS-transform position
+  // of cropImg's top-left within the body's local coordinate system.
+  let x = 0, y = 0, el = cropImg;
+  while (el && el !== document.body) {
+    x += el.offsetLeft || 0;
+    y += el.offsetTop  || 0;
+    el = el.offsetParent;
+  }
+  return [x, y];
+}
+function clientToImage(clientX, clientY) {
+  const [bx, by] = clientToBodyLocal(clientX, clientY);
+  const [ox, oy] = imageOffsetInBody();
+  return [(bx - ox) / displayScale, (by - oy) / displayScale];
 }
 
 function onHandleDown(e) {
