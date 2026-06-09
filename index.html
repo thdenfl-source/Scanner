@@ -332,6 +332,7 @@
   <div class="crop-bottom">
     <button id="btn-auto">⌖ 자동</button>
     <button id="btn-book">📖 책</button>
+    <button id="btn-monitor">💻 모니터</button>
     <button id="btn-reset">⟲ 전체</button>
     <button id="btn-undo" disabled>↶ 되돌리기</button>
     <button id="btn-rotate">↻ 회전</button>
@@ -654,6 +655,7 @@ function openCrop(page, isNew) {
   // Reflect saved book mode in the cycle button so re-opening a page shows
   // the same label it had when it was committed.
   setBookBtnState(page.bookOrient ? page.bookOrient : 'off');
+  setMonitorBtn(page.descreen || 'off');
   cropImg.onload = () => {
     const rect = cropImg.getBoundingClientRect();
     displayScale = rect.width / page.srcW;
@@ -1200,6 +1202,77 @@ $('btn-book').onclick = () => {
   };
   toast(msgs[next]);
 };
+
+/* ---------- Monitor descreen ----------
+   Captures of computer monitors / projectors show moiré (interference
+   between the sensor's pixel grid and the display's). A toggle on the
+   crop view stores a strength on the page and the warp step applies an
+   OpenCV bilateral + median pass to suppress the pattern. Cycle:
+       off → 약 → 중 → 강 → off
+*/
+const DESCREEN_STATES = ['off', 'low', 'med', 'high'];
+const DESCREEN_LABELS = {
+  off:  '💻 모니터',
+  low:  '💻 약',
+  med:  '💻 중',
+  high: '💻 강',
+};
+function setMonitorBtn(mode) {
+  const btn = $('btn-monitor');
+  btn.textContent = DESCREEN_LABELS[mode];
+  btn.classList.toggle('toggled', mode !== 'off');
+}
+$('btn-monitor').onclick = () => {
+  const p = state.pending && state.pending.page;
+  if (!p) return;
+  const cur = p.descreen || 'off';
+  const next = DESCREEN_STATES[(DESCREEN_STATES.indexOf(cur) + 1) % DESCREEN_STATES.length];
+  p.descreen = next === 'off' ? null : next;
+  setMonitorBtn(next);
+  const msgs = {
+    off:  '모니터 보정 끔',
+    low:  '모니터 보정 약 — 가벼운 무아레 제거',
+    med:  '모니터 보정 중 — 균형 잡힌 제거',
+    high: '모니터 보정 강 — 강한 제거 (글자 부드러워질 수 있음)',
+  };
+  toast(msgs[next]);
+};
+
+// Apply moiré-reduction filter in place on an RGBA cv.Mat.
+// Bilateral filter on RGB channels (it can't run on the alpha plane)
+// followed by a small median blur knocks down high-frequency screen
+// patterns while keeping edges relatively sharp.
+function applyDescreenInPlace(mat, strength) {
+  if (!strength) return;
+  const params = {
+    low:  { d: 5, sc: 18, ss: 18, med: 0 },
+    med:  { d: 7, sc: 32, ss: 32, med: 3 },
+    high: { d: 9, sc: 50, ss: 50, med: 5 },
+  }[strength] || null;
+  if (!params) return;
+  if (!state.cvReady || typeof cv === 'undefined') return;
+
+  let rgb = null, filt = null;
+  try {
+    rgb = new cv.Mat();
+    filt = new cv.Mat();
+    cv.cvtColor(mat, rgb, cv.COLOR_RGBA2RGB);
+    cv.bilateralFilter(rgb, filt, params.d, params.sc, params.ss, cv.BORDER_REPLICATE);
+    if (params.med > 0) {
+      const m2 = new cv.Mat();
+      cv.medianBlur(filt, m2, params.med);
+      filt.delete();
+      filt = m2;
+    }
+    cv.cvtColor(filt, mat, cv.COLOR_RGB2RGBA);
+  } catch (e) {
+    console.warn('descreen failed', e);
+  } finally {
+    if (rgb) rgb.delete();
+    if (filt) filt.delete();
+  }
+}
+
 // The 자동 button toggles between "자동" (run edge detection) and
 // "수동" (clear to default rectangle so the user can adjust freely).
 // Each press swaps the label and applies the new mode.
@@ -1395,8 +1468,8 @@ async function warpBookSplit(page) {
       const oW = Math.max(8, Math.round(W    * scale));
       const tH = Math.max(8, Math.round(topH * scale));
       const bH = Math.max(8, Math.round(botH * scale));
-      const topUrl = await remapBookPatch(src, P, oW, tH, 0, 1, 0,   0.5);
-      const botUrl = await remapBookPatch(src, P, oW, bH, 0, 1, 0.5, 0.5);
+      const topUrl = await remapBookPatch(src, P, oW, tH, 0, 1, 0,   0.5, page.descreen);
+      const botUrl = await remapBookPatch(src, P, oW, bH, 0, 1, 0.5, 0.5, page.descreen);
       return [topUrl, botUrl];
     } else {
       // Split vertically at u = 0.5 (spine is TopMid–BotMid).
@@ -1407,8 +1480,8 @@ async function warpBookSplit(page) {
       const lW = Math.max(8, Math.round(leftW  * scale));
       const rW = Math.max(8, Math.round(rightW * scale));
       const oH = Math.max(8, Math.round(H      * scale));
-      const leftUrl  = await remapBookPatch(src, P, lW, oH, 0,   0.5, 0, 1);
-      const rightUrl = await remapBookPatch(src, P, rW, oH, 0.5, 0.5, 0, 1);
+      const leftUrl  = await remapBookPatch(src, P, lW, oH, 0,   0.5, 0, 1, page.descreen);
+      const rightUrl = await remapBookPatch(src, P, rW, oH, 0.5, 0.5, 0, 1, page.descreen);
       return [leftUrl, rightUrl];
     }
   } finally {
@@ -1421,7 +1494,7 @@ async function warpBookSplit(page) {
 // points (corner — quarter — mid — quarter — corner), so the curl on
 // every edge — including intermediate points along the long axis — is
 // straightened in the dewarped result.
-async function remapBookPatch(src, P, outW, outH, uStart, uSpan, vStart, vSpan) {
+async function remapBookPatch(src, P, outW, outH, uStart, uSpan, vStart, vSpan, descreen) {
   // 16-point: [0:TL 1 2:TopMid 3 4:TR 5 6:RightMid 7 8:BR 9 10:BotMid 11 12:BL 13 14:LeftMid 15]
   const TL=P[0],  T1=P[1],  TM=P[2],  T3=P[3];
   const TR=P[4],  R1=P[5],  RM=P[6],  R3=P[7];
@@ -1517,6 +1590,7 @@ async function remapBookPatch(src, P, outW, outH, uStart, uSpan, vStart, vSpan) 
     mapX.data32F.set(mxArr);
     mapY.data32F.set(myArr);
     cv.remap(src, dst, mapX, mapY, cv.INTER_LINEAR, cv.BORDER_REPLICATE);
+    applyDescreenInPlace(dst, descreen);
     const outCanvas = document.createElement('canvas');
     outCanvas.width = outW; outCanvas.height = outH;
     cv.imshow(outCanvas, dst);
@@ -1735,6 +1809,7 @@ async function warpCrop(page) {
     const M = cv.getPerspectiveTransform(srcTri, dstTri);
     const dst = new cv.Mat();
     cv.warpPerspective(src, dst, M, new cv.Size(outW, outH));
+    applyDescreenInPlace(dst, page.descreen);
     const out = document.createElement('canvas');
     out.width = outW; out.height = outH;
     cv.imshow(out, dst);
