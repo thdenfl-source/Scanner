@@ -832,11 +832,14 @@ function openCrop(page, isNew) {
   disposePreviewSrc();
   $('crop-preview').classList.remove('active');
   cropImg.onload = () => {
-    const rect = cropImg.getBoundingClientRect();
-    displayScale = rect.width / page.srcW;
-    cropSvg.setAttribute('width', rect.width);
-    cropSvg.setAttribute('height', rect.height);
-    cropSvg.setAttribute('viewBox', `0 0 ${rect.width} ${rect.height}`);
+    // Use the element's layout (pre-transform) size so the orientation
+    // lock's body rotation doesn't make displayScale flip width/height.
+    const w = cropImg.offsetWidth  || cropImg.getBoundingClientRect().width;
+    const h = cropImg.offsetHeight || cropImg.getBoundingClientRect().height;
+    displayScale = w / page.srcW;
+    cropSvg.setAttribute('width', w);
+    cropSvg.setAttribute('height', h);
+    cropSvg.setAttribute('viewBox', `0 0 ${w} ${h}`);
     // If this page already has descreen values, paint the preview.
     schedulePreview();
     if (!page.corners) {
@@ -1131,6 +1134,25 @@ let dragStartCorners = null;  // snapshot for edge drags
 let dragRaf = 0;
 let dragLastEvent = null;
 
+// Map viewport coords (clientX, clientY from a pointer event) into the
+// source image's pixel coordinate system. Goes through the SVG's CTM so
+// any CSS transforms on the layout — most importantly the body's -90°
+// rotation in the orientation lock — are inverted before we divide by
+// displayScale. Without this the drag direction is wrong when the
+// device viewport and the photo's aspect disagree on iPad.
+function clientToImage(clientX, clientY) {
+  const ctm = cropSvg.getScreenCTM && cropSvg.getScreenCTM();
+  if (ctm) {
+    const pt = cropSvg.createSVGPoint();
+    pt.x = clientX; pt.y = clientY;
+    const local = pt.matrixTransform(ctm.inverse());
+    return [local.x / displayScale, local.y / displayScale];
+  }
+  // Last-resort fallback for older engines.
+  const rect = cropImg.getBoundingClientRect();
+  return [(clientX - rect.left) / displayScale, (clientY - rect.top) / displayScale];
+}
+
 function onHandleDown(e) {
   e.preventDefault();
   const el = e.currentTarget;
@@ -1138,9 +1160,7 @@ function onHandleDown(e) {
   dragIndex = parseInt(el.dataset.i, 10);
   dragHandle = dragIndex;
   dragPointerId = e.pointerId;
-  const rect = cropImg.getBoundingClientRect();
-  const px = (e.clientX - rect.left) / displayScale;
-  const py = (e.clientY - rect.top) / displayScale;
+  const [px, py] = clientToImage(e.clientX, e.clientY);
   const p = state.pending.page;
   if (dragType === 'corner') {
     const [cx, cy] = p.corners[dragIndex];
@@ -1167,9 +1187,7 @@ function onHandleMove(e) {
     dragRaf = 0;
     const ev = dragLastEvent;
     if (!ev || dragIndex == null) return;
-    const rect = cropImg.getBoundingClientRect();
-    const px = (ev.clientX - rect.left) / displayScale;
-    const py = (ev.clientY - rect.top) / displayScale;
+    const [px, py] = clientToImage(ev.clientX, ev.clientY);
     const p = state.pending.page;
     if (dragType === 'corner') {
       p.corners[dragIndex] = [
@@ -1274,13 +1292,14 @@ function updateMagnifier(clientX, clientY) {
   ctx.fillStyle = '#4ea1ff';
   ctx.beginPath(); ctx.arc(W/2, H/2, 3, 0, Math.PI*2); ctx.fill();
 
-  // Position the loupe in the corner farthest from the finger so it
-  // never sits under the hand. Relative to #crop-stage.
-  const stage = $('crop-stage').getBoundingClientRect();
-  const fx = clientX - stage.left;
-  const fy = clientY - stage.top;
-  const onRight = fx < stage.width / 2;
-  const onBottom = fy < stage.height / 2;
+  // Position the loupe in the corner of the *image* (not the viewport)
+  // farthest from the finger so it never sits under the hand. Using
+  // image-local coords via clientToImage() makes this respect the
+  // orientation-lock rotation: the user's left/right is always the
+  // image's left/right, regardless of how the device is held.
+  const [imgX, imgY] = clientToImage(clientX, clientY);
+  const onRight  = imgX < p.srcW / 2;   // finger on left of image → loupe on right
+  const onBottom = imgY < p.srcH / 2;   // finger on top of image → loupe on bottom
   _mag.el.style.left  = onRight  ? 'auto' : '12px';
   _mag.el.style.right = onRight  ? '12px' : 'auto';
   _mag.el.style.top   = onBottom ? 'auto' : '12px';
@@ -1714,10 +1733,12 @@ function rotateSource90() {
     // Rotate corners
     p.corners = p.corners.map(([x,y]) => [p.srcW - y, x]);
     cropImg.onload = () => {
-      const rect = cropImg.getBoundingClientRect();
-      displayScale = rect.width / p.srcW;
-      cropSvg.setAttribute('width', rect.width);
-      cropSvg.setAttribute('height', rect.height);
+      const w = cropImg.offsetWidth  || cropImg.getBoundingClientRect().width;
+      const h = cropImg.offsetHeight || cropImg.getBoundingClientRect().height;
+      displayScale = w / p.srcW;
+      cropSvg.setAttribute('width', w);
+      cropSvg.setAttribute('height', h);
+      cropSvg.setAttribute('viewBox', `0 0 ${w} ${h}`);
       drawCorners();
     };
     cropImg.src = p.srcDataUrl;
@@ -2403,6 +2424,29 @@ refreshPagesUI();
 startCamera();
 
 window.addEventListener('beforeunload', stopCamera);
+
+// Keep the crop view's pixel↔display mapping in sync when the device
+// rotates or the window resizes. We recompute the image's layout box
+// and re-render the handles so a finger placed on a corner still maps
+// to the same source-image pixel.
+function relayoutCrop() {
+  if (!state.pending || !state.pending.page) return;
+  const p = state.pending.page;
+  if (!cropImg.naturalWidth) return;
+  const w = cropImg.offsetWidth  || cropImg.getBoundingClientRect().width;
+  const h = cropImg.offsetHeight || cropImg.getBoundingClientRect().height;
+  if (!w || !h) return;
+  displayScale = w / p.srcW;
+  cropSvg.setAttribute('width', w);
+  cropSvg.setAttribute('height', h);
+  cropSvg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+  drawCorners();
+}
+window.addEventListener('resize', relayoutCrop);
+window.addEventListener('orientationchange', relayoutCrop);
+if (window.screen && screen.orientation && screen.orientation.addEventListener) {
+  screen.orientation.addEventListener('change', relayoutCrop);
+}
 </script>
 </body>
 </html>
