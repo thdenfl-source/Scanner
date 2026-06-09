@@ -147,6 +147,49 @@
   }
   #magnifier.active { opacity: 1; }
   #magnifier canvas { display: block; width: 100%; height: 100%; }
+
+  /* Monitor (descreen) slider panel. Each slider is centered at 0 and
+     applies in both directions: negative side does the opposite (e.g.
+     sharpen instead of smooth). The panel is anchored above the crop
+     bottom toolbar and hidden by default. */
+  .monitor-panel {
+    position: absolute;
+    left: 8px; right: 8px; bottom: 8px;
+    background: rgba(20,20,20,0.92);
+    border: 1px solid #2a2a2a;
+    border-radius: 12px;
+    padding: 10px 12px;
+    display: none;
+    z-index: 30;
+  }
+  .monitor-panel.active { display: block; }
+  .monitor-row {
+    display: flex; align-items: center; gap: 10px;
+    margin: 4px 0;
+  }
+  .monitor-row label {
+    width: 78px; flex-shrink: 0;
+    font-size: 12px; color: #ccc;
+  }
+  .monitor-row input[type="range"] {
+    flex: 1; min-width: 0;
+    accent-color: #4ea1ff;
+    background: transparent;
+  }
+  .monitor-row .val {
+    width: 38px; flex-shrink: 0;
+    text-align: right;
+    font-size: 12px; color: #4ea1ff;
+    font-variant-numeric: tabular-nums;
+  }
+  .monitor-reset {
+    margin-top: 6px;
+    background: transparent; color: #4ea1ff; border: 1px solid #2a3a52;
+    border-radius: 14px; padding: 5px 12px;
+    font-size: 12px; cursor: pointer;
+    float: right;
+  }
+  .monitor-reset:active { background: rgba(78,161,255,0.15); }
   .crop-line { stroke: #4ea1ff; stroke-width: 2; fill: rgba(78,161,255,0.12); }
   .crop-bottom {
     height: 96px; flex-shrink: 0;
@@ -328,6 +371,24 @@
       <svg id="crop-svg"></svg>
     </div>
     <div id="magnifier"><canvas id="mag-canvas" width="180" height="180"></canvas></div>
+    <div class="monitor-panel" id="monitor-panel">
+      <div class="monitor-row">
+        <label>무아레 제거</label>
+        <input type="range" id="m-smooth" min="-50" max="50" step="1" value="0">
+        <span class="val" id="m-smooth-v">0</span>
+      </div>
+      <div class="monitor-row">
+        <label>디테일 보존</label>
+        <input type="range" id="m-detail" min="-50" max="50" step="1" value="0">
+        <span class="val" id="m-detail-v">0</span>
+      </div>
+      <div class="monitor-row">
+        <label>글자 선명도</label>
+        <input type="range" id="m-sharp" min="-50" max="50" step="1" value="0">
+        <span class="val" id="m-sharp-v">0</span>
+      </div>
+      <button class="monitor-reset" id="m-reset">0으로 초기화</button>
+    </div>
   </div>
   <div class="crop-bottom">
     <button id="btn-auto">⌖ 자동</button>
@@ -655,7 +716,9 @@ function openCrop(page, isNew) {
   // Reflect saved book mode in the cycle button so re-opening a page shows
   // the same label it had when it was committed.
   setBookBtnState(page.bookOrient ? page.bookOrient : 'off');
-  setMonitorBtn(page.descreen || 'off');
+  setMonitorBtn(page.descreen);
+  syncMonitorPanel(page.descreen);
+  openMonitorPanel(false);
   cropImg.onload = () => {
     const rect = cropImg.getBoundingClientRect();
     displayScale = rect.width / page.srcW;
@@ -1203,73 +1266,155 @@ $('btn-book').onclick = () => {
   toast(msgs[next]);
 };
 
-/* ---------- Monitor descreen ----------
+/* ---------- Monitor descreen (manual sliders) ----------
    Captures of computer monitors / projectors show moiré (interference
-   between the sensor's pixel grid and the display's). A toggle on the
-   crop view stores a strength on the page and the warp step applies an
-   OpenCV bilateral + median pass to suppress the pattern. Cycle:
-       off → 약 → 중 → 강 → off
-*/
-const DESCREEN_STATES = ['off', 'low', 'med', 'high'];
-const DESCREEN_LABELS = {
-  off:  '💻 모니터',
-  low:  '💻 약',
-  med:  '💻 중',
-  high: '💻 강',
-};
-function setMonitorBtn(mode) {
-  const btn = $('btn-monitor');
-  btn.textContent = DESCREEN_LABELS[mode];
-  btn.classList.toggle('toggled', mode !== 'off');
+   between the sensor's pixel grid and the display's). The 💻 button
+   toggles a small panel with 3 sliders, each centered at 0 — sliding
+   right or left applies the effect in opposite directions:
+
+       무아레 제거 : -50  ← (sharpen with Laplacian) … 0 (off) …
+                      → bilateral smoothing  +50
+       디테일 보존 : -50  ← (extra Gaussian blur, kill residual pattern)
+                      0 (balanced) → preserve edges harder  +50
+       글자 선명도 : -50  ← (soften with Gaussian)
+                      0 (off) → unsharp mask sharpening  +50
+
+   The values live on p.descreen = { smooth, detail, sharp }. All zero
+   means "no descreen pass at all" so the original image is returned
+   untouched. */
+const DESCREEN_DEFAULT = { smooth: 0, detail: 0, sharp: 0 };
+function descreenIsActive(ds) {
+  return !!(ds && (ds.smooth || ds.detail || ds.sharp));
 }
+function setMonitorBtn(ds) {
+  const btn = $('btn-monitor');
+  const active = descreenIsActive(ds);
+  btn.textContent = active ? '💻 적용중' : '💻 모니터';
+  btn.classList.toggle('toggled', active);
+}
+function syncMonitorPanel(ds) {
+  const v = ds || DESCREEN_DEFAULT;
+  $('m-smooth').value = v.smooth || 0;
+  $('m-detail').value = v.detail || 0;
+  $('m-sharp').value  = v.sharp  || 0;
+  $('m-smooth-v').textContent = (v.smooth >= 0 ? '+' : '') + (v.smooth || 0);
+  $('m-detail-v').textContent = (v.detail >= 0 ? '+' : '') + (v.detail || 0);
+  $('m-sharp-v').textContent  = (v.sharp  >= 0 ? '+' : '') + (v.sharp  || 0);
+}
+function openMonitorPanel(open) {
+  $('monitor-panel').classList.toggle('active', !!open);
+}
+
 $('btn-monitor').onclick = () => {
   const p = state.pending && state.pending.page;
   if (!p) return;
-  const cur = p.descreen || 'off';
-  const next = DESCREEN_STATES[(DESCREEN_STATES.indexOf(cur) + 1) % DESCREEN_STATES.length];
-  p.descreen = next === 'off' ? null : next;
-  setMonitorBtn(next);
-  const msgs = {
-    off:  '모니터 보정 끔',
-    low:  '모니터 보정 약 — 가벼운 무아레 제거',
-    med:  '모니터 보정 중 — 균형 잡힌 제거',
-    high: '모니터 보정 강 — 강한 제거 (글자 부드러워질 수 있음)',
-  };
-  toast(msgs[next]);
+  const panel = $('monitor-panel');
+  const willOpen = !panel.classList.contains('active');
+  openMonitorPanel(willOpen);
+  if (willOpen) syncMonitorPanel(p.descreen);
 };
 
-// Apply moiré-reduction filter in place on an RGBA cv.Mat.
-// Bilateral filter on RGB channels (it can't run on the alpha plane)
-// followed by a small median blur knocks down high-frequency screen
-// patterns while keeping edges relatively sharp.
-function applyDescreenInPlace(mat, strength) {
-  if (!strength) return;
-  const params = {
-    low:  { d: 5, sc: 18, ss: 18, med: 0 },
-    med:  { d: 7, sc: 32, ss: 32, med: 3 },
-    high: { d: 9, sc: 50, ss: 50, med: 5 },
-  }[strength] || null;
-  if (!params) return;
-  if (!state.cvReady || typeof cv === 'undefined') return;
+function attachSlider(inputId, valId, key) {
+  const input = $(inputId), val = $(valId);
+  const onInput = () => {
+    const v = parseInt(input.value, 10) || 0;
+    val.textContent = (v >= 0 ? '+' : '') + v;
+    const p = state.pending && state.pending.page;
+    if (!p) return;
+    p.descreen = Object.assign({}, p.descreen || DESCREEN_DEFAULT, { [key]: v });
+    if (!descreenIsActive(p.descreen)) p.descreen = null;
+    setMonitorBtn(p.descreen);
+  };
+  input.addEventListener('input', onInput);
+  input.addEventListener('change', onInput);
+}
+attachSlider('m-smooth', 'm-smooth-v', 'smooth');
+attachSlider('m-detail', 'm-detail-v', 'detail');
+attachSlider('m-sharp',  'm-sharp-v',  'sharp');
+$('m-reset').onclick = () => {
+  const p = state.pending && state.pending.page;
+  if (!p) return;
+  p.descreen = null;
+  syncMonitorPanel(null);
+  setMonitorBtn(null);
+};
 
-  let rgb = null, filt = null;
+// Apply the descreen filter in place on an RGBA cv.Mat. Each cv.Mat is
+// tracked in `tmps` so the finally clause can free all of them no matter
+// where we bail out. The pipeline is:
+//   1. smooth>0  → bilateral filter (sigmas scaled by `smooth`, window
+//      `d` grows with strength).
+//      smooth<0  → mild Laplacian-based sharpening blend.
+//   2. detail<0  → extra Gaussian blur (kills any leftover pattern).
+//      detail>0  → reduces bilateral sigmaSpace (sharper edges).
+//   3. sharp>0   → unsharp mask (recovers text).
+//      sharp<0   → Gaussian blur blend (extra softening).
+function applyDescreenInPlace(mat, ds) {
+  if (!descreenIsActive(ds)) return;
+  if (!state.cvReady || typeof cv === 'undefined') return;
+  const smooth = ds.smooth | 0, detail = ds.detail | 0, sharp = ds.sharp | 0;
+
+  const tmps = [];
+  const alloc = () => { const m = new cv.Mat(); tmps.push(m); return m; };
   try {
-    rgb = new cv.Mat();
-    filt = new cv.Mat();
-    cv.cvtColor(mat, rgb, cv.COLOR_RGBA2RGB);
-    cv.bilateralFilter(rgb, filt, params.d, params.sc, params.ss, cv.BORDER_REPLICATE);
-    if (params.med > 0) {
-      const m2 = new cv.Mat();
-      cv.medianBlur(filt, m2, params.med);
-      filt.delete();
-      filt = m2;
+    let work = alloc();
+    cv.cvtColor(mat, work, cv.COLOR_RGBA2RGB);
+
+    if (smooth > 0) {
+      const sc = 8 + smooth * 1.6;
+      // Negative `detail` pushes sigmaSpace UP (more aggressive),
+      // positive `detail` pulls it DOWN (sharper edges preserved).
+      const ss = Math.max(5, 8 + smooth * 1.6 - detail * 0.8);
+      const d = smooth > 30 ? 9 : smooth > 15 ? 7 : 5;
+      const out = alloc();
+      cv.bilateralFilter(work, out, d, sc, ss, cv.BORDER_REPLICATE);
+      work = out;
+      if (smooth > 30) {
+        const med = alloc();
+        cv.medianBlur(work, med, smooth > 40 ? 5 : 3);
+        work = med;
+      }
+    } else if (smooth < 0) {
+      // Mild sharpening blend.
+      const k = cv.matFromArray(3, 3, cv.CV_32FC1,
+        [0, -1, 0, -1, 5, -1, 0, -1, 0]);
+      tmps.push(k);
+      const sharpened = alloc();
+      cv.filter2D(work, sharpened, -1, k);
+      const out = alloc();
+      const alpha = Math.min(1, -smooth / 50);
+      cv.addWeighted(sharpened, alpha, work, 1 - alpha, 0, out);
+      work = out;
     }
-    cv.cvtColor(filt, mat, cv.COLOR_RGB2RGBA);
+
+    if (detail < 0) {
+      // Extra blur to defeat residual pattern.
+      const blurred = alloc();
+      const sigma = Math.max(0.6, -detail / 18);
+      cv.GaussianBlur(work, blurred, new cv.Size(0, 0), sigma);
+      work = blurred;
+    }
+
+    if (sharp !== 0) {
+      const blur = alloc();
+      const sigma = 1.0 + Math.abs(sharp) / 22;
+      cv.GaussianBlur(work, blur, new cv.Size(0, 0), sigma);
+      const out = alloc();
+      if (sharp > 0) {
+        const amount = sharp / 25; // 0..2
+        cv.addWeighted(work, 1 + amount, blur, -amount, 0, out);
+      } else {
+        const t = Math.min(1, -sharp / 50);
+        cv.addWeighted(work, 1 - t, blur, t, 0, out);
+      }
+      work = out;
+    }
+
+    cv.cvtColor(work, mat, cv.COLOR_RGB2RGBA);
   } catch (e) {
     console.warn('descreen failed', e);
   } finally {
-    if (rgb) rgb.delete();
-    if (filt) filt.delete();
+    tmps.forEach(m => { try { m.delete(); } catch (_) {} });
   }
 }
 
