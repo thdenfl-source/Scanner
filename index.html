@@ -828,6 +828,8 @@ const snd = {
   orientLast: null,
   orientLevelLast: 0,
   orientHandler: null,
+  // Weather-radar history buffer
+  radar: { pts: [], ping: null },
 };
 
 async function sndStart() {
@@ -843,6 +845,7 @@ async function sndStart() {
     snd.ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
     snd.mics = [];
     snd.stereo = null; snd.hasStereo = false;
+    snd.radar = { pts: [], ping: null };
     snd.orientTgt = { x: 0.5, y: 0.5 };
     snd.orientLast = null; snd.orientLevelLast = 0;
 
@@ -1071,6 +1074,31 @@ function sndXCorr(a, b, maxLag) {
   return { lag, conf: Math.max(0, Math.min(1, bestVal)) };
 }
 
+// Interpolate the weather-radar color palette (intensity 0..1 → [r,g,b]).
+// 0 = blue (distant/quiet), 1 = white-hot (loud/close center).
+function sndRadarColor(t) {
+  const stops = [
+    [0.00,   0,  30, 220],
+    [0.18,   0, 200, 255],
+    [0.34,   0, 220,   0],
+    [0.50, 255, 255,   0],
+    [0.65, 255, 140,   0],
+    [0.80, 255,   0,   0],
+    [1.00, 255, 255, 255],
+  ];
+  for (let i = 1; i < stops.length; i++) {
+    if (t <= stops[i][0]) {
+      const f = (t - stops[i-1][0]) / (stops[i][0] - stops[i-1][0]);
+      return [
+        (stops[i-1][1] + f * (stops[i][1] - stops[i-1][1])) | 0,
+        (stops[i-1][2] + f * (stops[i][2] - stops[i-1][2])) | 0,
+        (stops[i-1][3] + f * (stops[i][3] - stops[i-1][3])) | 0,
+      ];
+    }
+  }
+  return [255, 255, 255];
+}
+
 function sndRender() {
   if (!snd.active) return;
 
@@ -1204,82 +1232,99 @@ function sndRender() {
   const cx = snd.sx * W;
 
   // ========================================================
-  // 1) VERTICAL SOUND COLUMN highlighting the azimuth direction
+  // RADAR VISUALIZATION — weather-radar-style sound source map
+  // History buffer of {x, lvl, conf, age} pushed every frame.
+  // Blobs drawn oldest→newest so fresh readings render on top.
   // ========================================================
-  {
-    // Column half-width: wide when uncertain, tightening as confidence rises.
-    const span = W * (0.26 - 0.14 * Math.min(1, conf)) * (0.7 + 0.3 * level);
-    const aHot = Math.min(op,        (level * 0.85 + 0.10) * op);
-    const aMid = Math.min(op * 0.8,  (level * 0.60 + 0.05) * op);
-    const aFar = Math.min(op * 0.45, (level * 0.35) * op);
+  const MAX_PTS = 55;  // ~1.8 s at 30 fps before a reading fully fades
 
-    // Symmetric horizontal gradient → a soft column centered on cx.
-    const grad = g.createLinearGradient(cx - span, 0, cx + span, 0);
-    const stops = (hot, mid, far) => {
-      grad.addColorStop(0.00, far);
-      grad.addColorStop(0.22, mid);
-      grad.addColorStop(0.42, hot);
-      grad.addColorStop(0.50, hot);
-      grad.addColorStop(0.58, hot);
-      grad.addColorStop(0.78, mid);
-      grad.addColorStop(1.00, far);
-    };
-    switch (snd.colorScheme) {
-      case 'gray':
-        stops(`rgba(255,255,255,${aHot})`, `rgba(170,170,170,${aMid})`, `rgba(80,80,80,0)`);
-        break;
-      case 'rainbow':
-        // Hue follows level: blue(quiet) → green → yellow → red(loud).
-        const hue = 240 - 240 * Math.min(1, level * 1.2);
-        stops(`hsla(${hue},100%,55%,${aHot})`, `hsla(${hue + 20},100%,52%,${aMid})`, `hsla(${hue + 40},100%,50%,0)`);
-        break;
-      default: // 'red'
-        stops(`hsla(12,100%,57%,${aHot})`, `hsla(28,100%,55%,${aMid})`, `hsla(45,100%,60%,0)`);
+  // Record this frame's reading.
+  if (azX !== null && level > 0.04) {
+    snd.radar.pts.unshift({ x: azX, lvl: level, conf, age: 0 });
+    if (snd.radar.pts.length > MAX_PTS) snd.radar.pts.length = MAX_PTS;
+    // Trigger a ping ripple on a strong new hit.
+    if (level > 0.40 && (!snd.radar.ping || snd.radar.ping.age > 8)) {
+      snd.radar.ping = { x: azX, age: 0, lvl: level };
     }
-    g.fillStyle = grad;
-    g.fillRect(Math.max(0, cx - span), 0, Math.min(W, 2 * span), H);
   }
+  // Age all history points by one frame.
+  for (let i = 0; i < snd.radar.pts.length; i++) snd.radar.pts[i].age++;
 
-  // ========================================================
-  // 2) CENTERLINE + EDGE CHEVRONS marking the column
-  // ========================================================
-  if (level > 0.04) {
-    const aLine = Math.min(0.95, level * 1.1 + 0.12);
+  // Draw blobs from oldest to newest (painter's algorithm — fresh on top).
+  const aspectY = H / W;
+  for (let i = snd.radar.pts.length - 1; i >= 0; i--) {
+    const p = snd.radar.pts[i];
+    const fade = (1 - p.age / MAX_PTS) * op;
+    if (fade <= 0.01) continue;
+    const bx = p.x * W;
+    // Blob radius: wide when uncertain, tighter when confident & loud.
+    const blobR = W * (0.28 - 0.14 * Math.min(1, p.conf)) * (0.4 + 0.6 * Math.min(1, p.lvl));
     g.save();
-    g.shadowColor = 'rgba(255,210,60,0.7)';
-    g.shadowBlur = 8;
-
-    // Bright vertical centerline.
-    g.strokeStyle = `rgba(255,240,150,${aLine})`;
-    g.lineWidth = 2;
-    g.beginPath(); g.moveTo(cx, 0); g.lineTo(cx, H); g.stroke();
-
-    // Chevrons at top and bottom pointing inward to the column.
-    const tri = 11;
-    g.fillStyle = `rgba(255,230,90,${aLine})`;
-    g.beginPath(); g.moveTo(cx - tri, 2); g.lineTo(cx + tri, 2); g.lineTo(cx, tri + 4); g.closePath(); g.fill();
-    g.beginPath(); g.moveTo(cx - tri, H - 2); g.lineTo(cx + tri, H - 2); g.lineTo(cx, H - tri - 4); g.closePath(); g.fill();
+    g.translate(bx, H * 0.5);
+    g.scale(1, aspectY * 0.62);  // squish into a radar-echo oval
+    const grad = g.createRadialGradient(0, 0, 0, 0, 0, blobR);
+    const a = (t) => (fade * t).toFixed(3);
+    grad.addColorStop(0.00, `rgba(255,255,255,${a(0.95)})`);
+    grad.addColorStop(0.14, `rgba(255,  0,  0,${a(0.90)})`);
+    grad.addColorStop(0.28, `rgba(255,140,  0,${a(0.85)})`);
+    grad.addColorStop(0.44, `rgba(255,255,  0,${a(0.78)})`);
+    grad.addColorStop(0.60, `rgba(  0,220,  0,${a(0.68)})`);
+    grad.addColorStop(0.75, `rgba(  0,210,255,${a(0.50)})`);
+    grad.addColorStop(0.88, `rgba(  0, 60,230,${a(0.32)})`);
+    grad.addColorStop(1.00, `rgba(  0, 20,160,0)`);
+    g.fillStyle = grad;
+    g.beginPath();
+    g.arc(0, 0, blobR, 0, Math.PI * 2);
+    g.fill();
     g.restore();
   }
 
-  // ========================================================
-  // 3) PAN GUIDANCE — arrow toward the column when off-center
-  // ========================================================
-  {
-    const scX = W / 2, scY = H / 2;
-    const dx = cx - scX;
-    if (Math.abs(dx) > W * 0.06 && level > 0.05) {
-      const dir = dx > 0 ? 1 : -1;
-      const a = Math.min(0.95, level * 1.3 + 0.15);
-      const baseX = scX + dir * minDim * 0.06;
-      const tipX  = scX + dir * Math.min(Math.abs(dx) * 0.7, minDim * 0.26);
+  // Ping ripple — an expanding ring on strong new readings.
+  if (snd.radar.ping) {
+    const pg = snd.radar.ping;
+    pg.age++;
+    const maxPingAge = 32;
+    if (pg.age < maxPingAge) {
+      const pFade = (1 - pg.age / maxPingAge) * Math.min(1, pg.lvl * 1.3);
+      const pR = W * 0.10 + W * 0.24 * (pg.age / maxPingAge);
       g.save();
-      g.shadowColor = 'rgba(255,220,0,0.8)'; g.shadowBlur = 12;
+      g.translate(pg.x * W, H * 0.5);
+      g.scale(1, aspectY * 0.62);
+      g.strokeStyle = `rgba(255,230,80,${(pFade * 0.85).toFixed(3)})`;
+      g.lineWidth = 2.5;
+      g.beginPath(); g.arc(0, 0, pR, 0, Math.PI * 2); g.stroke();
+      g.restore();
+    } else {
+      snd.radar.ping = null;
+    }
+  }
+
+  // Subtle dashed center axis for spatial reference.
+  g.save();
+  g.strokeStyle = 'rgba(255,255,255,0.15)';
+  g.lineWidth = 1;
+  g.setLineDash([4, 10]);
+  g.beginPath(); g.moveTo(W / 2, 0); g.lineTo(W / 2, H); g.stroke();
+  g.restore();
+
+  // Pan guidance arrow toward the most recent radar reading.
+  if (snd.radar.pts.length > 0 && level > 0.05) {
+    const p0 = snd.radar.pts[0];
+    const rcx = p0.x * W;
+    const scX = W / 2, scY = H / 2;
+    const dx = rcx - scX;
+    if (Math.abs(dx) > W * 0.07) {
+      const dir = dx > 0 ? 1 : -1;
+      const aArrow = Math.min(0.95, level * 1.3 + 0.15);
+      const baseX = scX + dir * minDim * 0.06;
+      const tipX  = scX + dir * Math.min(Math.abs(dx) * 0.72, minDim * 0.27);
+      g.save();
+      g.shadowColor = 'rgba(255,220,0,0.75)'; g.shadowBlur = 12;
       g.lineCap = 'round';
-      g.strokeStyle = `rgba(255,230,0,${a})`; g.lineWidth = 3.5;
+      g.strokeStyle = `rgba(255,230,0,${aArrow})`; g.lineWidth = 3.5;
       g.beginPath(); g.moveTo(baseX, scY); g.lineTo(tipX, scY); g.stroke();
       const h = Math.max(13, minDim * 0.038);
-      g.fillStyle = `rgba(255,230,0,${a})`;
+      g.fillStyle = `rgba(255,230,0,${aArrow})`;
       g.beginPath();
       g.moveTo(tipX + dir * 2, scY);
       g.lineTo(tipX - dir * h, scY - h * 0.7);
@@ -1289,12 +1334,10 @@ function sndRender() {
     }
   }
 
-  // ========================================================
-  // 4) STATUS HINT (mono devices / searching)
-  // ========================================================
+  // Mono-device hint text.
   if (!snd.hasStereo && level > 0.05) {
     g.save();
-    g.fillStyle = 'rgba(255,255,255,0.8)';
+    g.fillStyle = 'rgba(255,255,255,0.78)';
     g.font = '12px -apple-system,sans-serif';
     g.textAlign = 'center';
     g.fillText('스테레오 미지원 — 카메라를 좌우로 천천히 움직여 탐색', W / 2, 22);
