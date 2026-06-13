@@ -871,6 +871,11 @@ async function sndStart() {
         splitter.connect(anR, 1, 0);
         snd.stereo = {
           stream: ss, src: sSrc, splitter, anL, anR,
+          // Time-domain buffers are the key to a reliable azimuth estimate:
+          // both channels come from ONE stream so they share a sample clock,
+          // making inter-channel cross-correlation (ITD) physically valid.
+          tBufL: new Float32Array(anL.fftSize),
+          tBufR: new Float32Array(anR.fftSize),
           fBufL: new Float32Array(anL.frequencyBinCount),
           fBufR: new Float32Array(anR.frequencyBinCount),
         };
@@ -1031,6 +1036,41 @@ function sndNCC(a, b, maxD) {
   return bestLag;
 }
 
+// Cross-correlation between two SYNCHRONIZED channels (e.g. stereo L/R from
+// a single getUserMedia stream). Returns { lag, conf }:
+//   lag  — fractional sample delay (parabolic-interpolated) of channel b
+//          relative to a. lag > 0 ⇒ b arrives later ⇒ source nearer a's side.
+//   conf — normalized peak height 0..1, used to weight/gate the estimate.
+function sndXCorr(a, b, maxLag) {
+  const n = a.length;
+  let ea = 0, eb = 0;
+  for (let i = 0; i < n; i++) { ea += a[i] * a[i]; eb += b[i] * b[i]; }
+  if (ea < 1e-8 || eb < 1e-8) return { lag: 0, conf: 0 };
+  const norm = Math.sqrt(ea * eb);
+
+  // Correlation value at integer lag d:  Σ a[i]·b[i+d] / norm
+  const vals = new Float32Array(2 * maxLag + 1);
+  let bestIdx = maxLag, bestVal = -Infinity;
+  for (let d = -maxLag; d <= maxLag; d++) {
+    let s = 0;
+    const lo = d < 0 ? -d : 0;
+    const hi = d < 0 ? n : n - d;
+    for (let i = lo; i < hi; i++) s += a[i] * b[i + d];
+    const v = s / norm;
+    vals[d + maxLag] = v;
+    if (v > bestVal) { bestVal = v; bestIdx = d + maxLag; }
+  }
+
+  // Sub-sample peak via parabolic interpolation on the 3 points around the max.
+  let lag = bestIdx - maxLag;
+  const vm = bestIdx > 0 ? vals[bestIdx - 1] : bestVal;
+  const vp = bestIdx < 2 * maxLag ? vals[bestIdx + 1] : bestVal;
+  const denom = vm - 2 * bestVal + vp;
+  if (denom !== 0) lag += 0.5 * (vm - vp) / denom;
+
+  return { lag, conf: Math.max(0, Math.min(1, bestVal)) };
+}
+
 function sndRender() {
   if (!snd.active) return;
 
@@ -1078,241 +1118,186 @@ function sndRender() {
   const smoothL = snd.sl;
 
   // ================================================================
-  // Direction estimation — three independent sources, blended:
+  // HORIZONTAL DIRECTION (azimuth) from the SYNCHRONIZED stereo pair.
   //
-  //  A) Stereo L/R channel balance  → horizontal (X axis)
-  //     Works stationary; most reliable on phones with true stereo.
-  //
-  //  B) Separate-mic dB difference  → vertical (Y axis, or X if ≥3 mics)
-  //     Uses individually enumerated audio-input devices.
-  //
-  //  C) DeviceOrientation gradient  → both axes
-  //     User pans the camera; amplitude change correlates with direction.
-  //     Works with even a single mono mic — user must sweep the camera.
+  // In a browser the only spatially-coherent signal we can trust is a
+  // single 2-channel stream (shared sample clock). We combine two cues:
+  //   • ITD — inter-channel time delay via cross-correlation (sndXCorr).
+  //           Sharp and accurate when a transient/broadband sound is
+  //           present; gated by correlation confidence.
+  //   • ILD — inter-channel level difference in the selected band.
+  //           Unambiguous in sign (louder channel = that side); used as
+  //           the baseline and to disambiguate the ITD sign.
+  // Elevation cannot be recovered from two omnidirectional channels, so
+  // we represent the result honestly as a VERTICAL COLUMN at the azimuth.
   // ================================================================
-  let tgtX = 0.5, tgtY = 0.5;
-  let hasX = false, hasY = false;
-
-  // ── A) Stereo L/R ──────────────────────────────────────────────────
-  if (snd.hasStereo && snd.stereo) {
-    const { anL, anR, fBufL, fBufR } = snd.stereo;
-    anL.getFloatFrequencyData(fBufL);
-    anR.getFloatFrequencyData(fBufR);
-    let pkL = -150, pkR = -150;
-    const fbins = fBufL.length;
-    const bLo2 = Math.max(0, Math.floor(snd.freqLo / (sr / 2) * fbins));
-    const bHi2 = Math.min(fbins - 1, Math.ceil(snd.freqHi / (sr / 2) * fbins));
-    for (let b = bLo2; b <= bHi2; b++) {
-      if (fBufL[b] > pkL) pkL = fBufL[b];
-      if (fBufR[b] > pkR) pkR = fBufR[b];
-    }
-    const diffLR = pkL - pkR; // +ve = L louder = source on LEFT → tgtX < 0.5
-    if (isFinite(diffLR) && Math.abs(diffLR) > 0.5) {
-      tgtX = 0.5 - Math.max(-0.45, Math.min(0.45, diffLR / 18));
-      hasX = true;
-    }
-  }
-
-  // ── B) Separate mic comparison ──────────────────────────────────────
-  if (mics.length >= 2) {
-    const dbDiff01 = bandPeakDb[0] - bandPeakDb[1];
-    if (isFinite(dbDiff01) && Math.abs(dbDiff01) > 0.5) {
-      // Assume mic[0]=top, mic[1]=bottom → Y direction.
-      tgtY = 0.5 - Math.max(-0.45, Math.min(0.45, dbDiff01 / 22));
-      hasY = true;
-    }
-    // TDOA refinement for Y.
-    if (rawL > 0.12) {
-      const maxD = Math.ceil(0.20 / 343 * sr);
-      const lag01 = sndNCC(mics[0].buf, mics[1].buf, maxD);
-      const sinV = Math.min(1, Math.max(-1, (lag01 / sr) * 343 / 0.15));
-      tgtY = (tgtY * 0.55) + ((0.5 - sinV * 0.45) * 0.45);
-      hasY = true;
-    }
-    if (mics.length >= 3 && !hasX) {
-      const dbDiff12 = bandPeakDb[1] - bandPeakDb[2];
-      if (isFinite(dbDiff12) && Math.abs(dbDiff12) > 0.5) {
-        tgtX = 0.5 + Math.max(-0.45, Math.min(0.45, dbDiff12 / 22));
-        hasX = true;
-      }
-    }
-  }
-
-  // ── C) DeviceOrientation gradient (always active as refinement) ──────
-  // Orientation estimate has its own smoothed target; blend in by weight.
-  // When orientation gives the only signal (hasX/hasY false), it dominates.
-  {
-    const oBlendX = hasX ? 0.20 : 0.60;
-    const oBlendY = hasY ? 0.20 : 0.60;
-    tgtX = tgtX * (1 - oBlendX) + snd.orientTgt.x * oBlendX;
-    tgtY = tgtY * (1 - oBlendY) + snd.orientTgt.y * oBlendY;
-  }
-
-  // Exponential smoothing on the final target position.
-  const alpha = 0.14;
-  snd.sx += alpha * (tgtX - snd.sx);
-  snd.sy += alpha * (tgtY - snd.sy);
-
-  const cx = snd.sx * W, cy = snd.sy * H;
   const minDim = Math.min(W, H);
   const op = snd.overlayOpacity;
 
+  let azX = null;     // estimated source screen-x fraction (0..1), null = unknown
+  let conf = 0;       // 0..1 confidence in the azimuth estimate
+  let stereoLvl = 0;  // 0..1 level seen on the stereo pair
+
+  if (snd.hasStereo && snd.stereo) {
+    const { anL, anR, tBufL, tBufR, fBufL, fBufR } = snd.stereo;
+    anL.getFloatTimeDomainData(tBufL);
+    anR.getFloatTimeDomainData(tBufR);
+    anL.getFloatFrequencyData(fBufL);
+    anR.getFloatFrequencyData(fBufR);
+
+    // Band-limited linear energy for each channel (ILD + gating).
+    const fbins = fBufL.length;
+    const bLo2 = Math.max(0, Math.floor(snd.freqLo / (sr / 2) * fbins));
+    const bHi2 = Math.min(fbins - 1, Math.ceil(snd.freqHi / (sr / 2) * fbins));
+    let eL = 0, eR = 0, pk = -150;
+    for (let b = bLo2; b <= bHi2; b++) {
+      const lL = Math.pow(10, fBufL[b] / 10);
+      const lR = Math.pow(10, fBufR[b] / 10);
+      eL += lL; eR += lR;
+      if (fBufL[b] > pk) pk = fBufL[b];
+      if (fBufR[b] > pk) pk = fBufR[b];
+    }
+    stereoLvl = Math.max(0, Math.min(1, (pk + 70) / 60));
+
+    // ILD azimuth: +1 ⇒ fully right, −1 ⇒ fully left.
+    const dbL = 10 * Math.log10(eL + 1e-12);
+    const dbR = 10 * Math.log10(eR + 1e-12);
+    const ildAz = Math.max(-1, Math.min(1, (dbR - dbL) / 9));
+
+    // ITD azimuth via cross-correlation on the synchronized channels.
+    // Max physical delay for a ~16 cm stereo baseline.
+    const maxLag = Math.max(3, Math.round(0.16 / 343 * sr));
+    const { lag, conf: xc } = sndXCorr(tBufL, tBufR, maxLag);
+    // lag>0 ⇒ R later ⇒ source nearer LEFT ⇒ negative azimuth.
+    const itdAz = Math.max(-1, Math.min(1, -lag / maxLag));
+
+    // Fuse: ILD is the baseline; trust ITD more when its peak is sharp and
+    // its sign agrees with ILD (or ILD is near zero / inconclusive).
+    let az = ildAz;
+    if (xc > 0.12 && (Math.sign(itdAz) === Math.sign(ildAz) || Math.abs(ildAz) < 0.05)) {
+      const w = Math.min(0.7, xc);          // ITD weight grows with confidence
+      az = ildAz * (1 - w) + itdAz * w;
+    }
+    conf = Math.max(Math.abs(ildAz), xc);
+
+    // Map azimuth to screen X. A small gain lets the column reach the edges
+    // before a full 90° so it aligns with the (narrower) camera field of view.
+    const gain = 1.25;
+    azX = Math.max(0.03, Math.min(0.97, 0.5 + 0.5 * az * gain));
+  } else {
+    // Mono fallback: no inter-channel data → use the camera-sweep gradient.
+    stereoLvl = smoothL;
+    if (smoothL > 0.06) { azX = snd.orientTgt.x; conf = 0.25; }
+  }
+
+  // Use the stronger of mic-array level and stereo-pair level for intensity.
+  const level = Math.max(smoothL, stereoLvl);
+
+  // Smooth the horizontal target. When we have a confident estimate, track
+  // it quickly; when quiet/unknown, drift gently back toward center.
+  if (azX !== null && level > 0.05) {
+    snd.sx += 0.22 * (azX - snd.sx);
+  } else {
+    snd.sx += 0.05 * (0.5 - snd.sx);
+  }
+  snd.sy = 0.5; // elevation not resolved → column spans full height
+  const cx = snd.sx * W;
+
   // ========================================================
-  // 1) HEAT-MAP SPOTLIGHT (larger + more visible at low levels)
+  // 1) VERTICAL SOUND COLUMN highlighting the azimuth direction
   // ========================================================
   {
-    const innerR = minDim * 0.05;
-    const outerR = minDim * 0.20 + minDim * 0.55 * smoothL;
-    const aO = Math.min(op * 0.85, (smoothL * 0.65 + 0.05) * op);
-    const aI = Math.min(op,        (smoothL * 0.90 + 0.08) * op);
+    // Column half-width: wide when uncertain, tightening as confidence rises.
+    const span = W * (0.26 - 0.14 * Math.min(1, conf)) * (0.7 + 0.3 * level);
+    const aHot = Math.min(op,        (level * 0.85 + 0.10) * op);
+    const aMid = Math.min(op * 0.8,  (level * 0.60 + 0.05) * op);
+    const aFar = Math.min(op * 0.45, (level * 0.35) * op);
 
-    const grad = g.createRadialGradient(cx, cy, innerR * 0.2, cx, cy, outerR);
+    // Symmetric horizontal gradient → a soft column centered on cx.
+    const grad = g.createLinearGradient(cx - span, 0, cx + span, 0);
+    const stops = (hot, mid, far) => {
+      grad.addColorStop(0.00, far);
+      grad.addColorStop(0.22, mid);
+      grad.addColorStop(0.42, hot);
+      grad.addColorStop(0.50, hot);
+      grad.addColorStop(0.58, hot);
+      grad.addColorStop(0.78, mid);
+      grad.addColorStop(1.00, far);
+    };
     switch (snd.colorScheme) {
       case 'gray':
-        grad.addColorStop(0,   `rgba(255,255,255,${aI})`);
-        grad.addColorStop(0.4, `rgba(160,160,160,${aO * 0.6})`);
-        grad.addColorStop(1,   `rgba(60,60,60,0)`);
+        stops(`rgba(255,255,255,${aHot})`, `rgba(170,170,170,${aMid})`, `rgba(80,80,80,0)`);
         break;
       case 'rainbow':
-        grad.addColorStop(0,    `hsla(0,100%,55%,${aI})`);
-        grad.addColorStop(0.25, `hsla(30,100%,55%,${aO * 0.7})`);
-        grad.addColorStop(0.5,  `hsla(60,100%,52%,${aO * 0.38})`);
-        grad.addColorStop(0.75, `hsla(120,100%,42%,${aO * 0.16})`);
-        grad.addColorStop(1,    `hsla(240,100%,50%,0)`);
+        // Hue follows level: blue(quiet) → green → yellow → red(loud).
+        const hue = 240 - 240 * Math.min(1, level * 1.2);
+        stops(`hsla(${hue},100%,55%,${aHot})`, `hsla(${hue + 20},100%,52%,${aMid})`, `hsla(${hue + 40},100%,50%,0)`);
         break;
       default: // 'red'
-        grad.addColorStop(0,   `hsla(15,100%,58%,${aI})`);
-        grad.addColorStop(0.3, `hsla(25,100%,55%,${aO * 0.72})`);
-        grad.addColorStop(0.65,`hsla(40,100%,60%,${aO * 0.28})`);
-        grad.addColorStop(1,   `hsla(50,100%,65%,0)`);
+        stops(`hsla(12,100%,57%,${aHot})`, `hsla(28,100%,55%,${aMid})`, `hsla(45,100%,60%,0)`);
     }
     g.fillStyle = grad;
-    g.fillRect(0, 0, W, H);
+    g.fillRect(Math.max(0, cx - span), 0, Math.min(W, 2 * span), H);
   }
 
   // ========================================================
-  // 2) TARGET CROSSHAIR at estimated source position
+  // 2) CENTERLINE + EDGE CHEVRONS marking the column
   // ========================================================
-  if (smoothL > 0.04) {
-    const chR = Math.max(20, minDim * 0.055);
-    const chAlpha = Math.min(0.95, smoothL * 1.1 + 0.1);
-    const chColor = `rgba(255,255,255,${chAlpha})`;
-
+  if (level > 0.04) {
+    const aLine = Math.min(0.95, level * 1.1 + 0.12);
     g.save();
-    g.shadowColor = 'rgba(255,200,50,0.7)';
-    g.shadowBlur = 10;
-    g.strokeStyle = chColor;
-    g.lineWidth = 1.8;
+    g.shadowColor = 'rgba(255,210,60,0.7)';
+    g.shadowBlur = 8;
 
-    // Cross lines
-    g.beginPath();
-    g.moveTo(cx - chR, cy); g.lineTo(cx - chR * 0.35, cy);
-    g.moveTo(cx + chR * 0.35, cy); g.lineTo(cx + chR, cy);
-    g.moveTo(cx, cy - chR); g.lineTo(cx, cy - chR * 0.35);
-    g.moveTo(cx, cy + chR * 0.35); g.lineTo(cx, cy + chR);
-    g.stroke();
+    // Bright vertical centerline.
+    g.strokeStyle = `rgba(255,240,150,${aLine})`;
+    g.lineWidth = 2;
+    g.beginPath(); g.moveTo(cx, 0); g.lineTo(cx, H); g.stroke();
 
-    // Outer circle
-    g.beginPath();
-    g.arc(cx, cy, chR, 0, Math.PI * 2);
-    g.strokeStyle = `rgba(255,230,80,${chAlpha * 0.75})`;
-    g.lineWidth = 1.5;
-    g.stroke();
-
-    // Inner dot
-    g.beginPath();
-    g.arc(cx, cy, 4, 0, Math.PI * 2);
-    g.fillStyle = `rgba(255,255,255,${chAlpha})`;
-    g.fill();
-
+    // Chevrons at top and bottom pointing inward to the column.
+    const tri = 11;
+    g.fillStyle = `rgba(255,230,90,${aLine})`;
+    g.beginPath(); g.moveTo(cx - tri, 2); g.lineTo(cx + tri, 2); g.lineTo(cx, tri + 4); g.closePath(); g.fill();
+    g.beginPath(); g.moveTo(cx - tri, H - 2); g.lineTo(cx + tri, H - 2); g.lineTo(cx, H - tri - 4); g.closePath(); g.fill();
     g.restore();
   }
 
   // ========================================================
-  // 3) DIRECTIONAL GUIDANCE ARROW (screen center → source)
+  // 3) PAN GUIDANCE — arrow toward the column when off-center
   // ========================================================
   {
     const scX = W / 2, scY = H / 2;
-    const dx = cx - scX, dy = cy - scY;
-    const dist = Math.sqrt(dx * dx + dy * dy);
-    const minDist = minDim * 0.08; // don't draw arrow if source ≈ center
-
-    if (dist > minDist && smoothL > 0.04) {
-      const angle = Math.atan2(dy, dx);
-      const bodyStart = minDim * 0.05;
-      const bodyEnd   = Math.min(dist * 0.72, minDim * 0.30);
-      const startX = scX + Math.cos(angle) * bodyStart;
-      const startY = scY + Math.sin(angle) * bodyStart;
-      const endX   = scX + Math.cos(angle) * bodyEnd;
-      const endY   = scY + Math.sin(angle) * bodyEnd;
-
-      const arrowAlpha = Math.min(0.98, smoothL * 1.3 + 0.12);
-
+    const dx = cx - scX;
+    if (Math.abs(dx) > W * 0.06 && level > 0.05) {
+      const dir = dx > 0 ? 1 : -1;
+      const a = Math.min(0.95, level * 1.3 + 0.15);
+      const baseX = scX + dir * minDim * 0.06;
+      const tipX  = scX + dir * Math.min(Math.abs(dx) * 0.7, minDim * 0.26);
       g.save();
-      g.shadowColor = 'rgba(255,220,0,0.8)';
-      g.shadowBlur = 14;
+      g.shadowColor = 'rgba(255,220,0,0.8)'; g.shadowBlur = 12;
       g.lineCap = 'round';
-
-      // Body
-      g.strokeStyle = `rgba(255,230,0,${arrowAlpha})`;
-      g.lineWidth = 3.5;
+      g.strokeStyle = `rgba(255,230,0,${a})`; g.lineWidth = 3.5;
+      g.beginPath(); g.moveTo(baseX, scY); g.lineTo(tipX, scY); g.stroke();
+      const h = Math.max(13, minDim * 0.038);
+      g.fillStyle = `rgba(255,230,0,${a})`;
       g.beginPath();
-      g.moveTo(startX, startY);
-      g.lineTo(endX, endY);
-      g.stroke();
-
-      // Arrowhead
-      const hLen = Math.max(14, minDim * 0.04);
-      const hAng = Math.PI / 5.5;
-      g.fillStyle = `rgba(255,230,0,${arrowAlpha})`;
-      g.beginPath();
-      g.moveTo(endX, endY);
-      g.lineTo(endX - hLen * Math.cos(angle - hAng), endY - hLen * Math.sin(angle - hAng));
-      g.lineTo(endX - hLen * Math.cos(angle + hAng), endY - hLen * Math.sin(angle + hAng));
-      g.closePath();
-      g.fill();
-
-      // Pulsing "tail" circle at origin
-      const pulse = 0.55 + 0.45 * Math.sin(Date.now() / 280);
-      g.beginPath();
-      g.arc(scX, scY, minDim * 0.025 * pulse, 0, Math.PI * 2);
-      g.fillStyle = `rgba(255,200,0,${arrowAlpha * 0.55 * pulse})`;
-      g.fill();
-
+      g.moveTo(tipX + dir * 2, scY);
+      g.lineTo(tipX - dir * h, scY - h * 0.7);
+      g.lineTo(tipX - dir * h, scY + h * 0.7);
+      g.closePath(); g.fill();
       g.restore();
     }
   }
 
   // ========================================================
-  // 4) EDGE INDICATORS when source is near screen border
+  // 4) STATUS HINT (mono devices / searching)
   // ========================================================
-  if (smoothL > 0.08) {
-    const pulse = 0.5 + 0.5 * Math.sin(Date.now() / 200);
-    const edgeAlpha = Math.min(0.95, (smoothL * 0.9 + 0.1) * pulse);
-    const tri = 18; // triangle half-width / height
-
+  if (!snd.hasStereo && level > 0.05) {
     g.save();
-    g.shadowBlur = 12;
-    g.shadowColor = 'rgba(255,80,0,0.7)';
-    g.fillStyle = `rgba(255,80,0,${edgeAlpha})`;
-
-    if (snd.sy < 0.15) {
-      // Source near top → triangle on top edge pointing down
-      const ex = Math.max(tri + 4, Math.min(W - tri - 4, cx));
-      g.beginPath(); g.moveTo(ex - tri, 4); g.lineTo(ex + tri, 4); g.lineTo(ex, tri + 4); g.closePath(); g.fill();
-    }
-    if (snd.sy > 0.85) {
-      const ex = Math.max(tri + 4, Math.min(W - tri - 4, cx));
-      g.beginPath(); g.moveTo(ex - tri, H - 4); g.lineTo(ex + tri, H - 4); g.lineTo(ex, H - tri - 4); g.closePath(); g.fill();
-    }
-    if (snd.sx < 0.12) {
-      const ey = Math.max(tri + 4, Math.min(H - tri - 4, cy));
-      g.beginPath(); g.moveTo(4, ey - tri); g.lineTo(4, ey + tri); g.lineTo(tri + 4, ey); g.closePath(); g.fill();
-    }
-    if (snd.sx > 0.88) {
-      const ey = Math.max(tri + 4, Math.min(H - tri - 4, cy));
-      g.beginPath(); g.moveTo(W - 4, ey - tri); g.lineTo(W - 4, ey + tri); g.lineTo(W - tri - 4, ey); g.closePath(); g.fill();
-    }
+    g.fillStyle = 'rgba(255,255,255,0.8)';
+    g.font = '12px -apple-system,sans-serif';
+    g.textAlign = 'center';
+    g.fillText('스테레오 미지원 — 카메라를 좌우로 천천히 움직여 탐색', W / 2, 22);
     g.restore();
   }
 
