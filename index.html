@@ -333,6 +333,32 @@
     flex: 1; display: flex; align-items: center; justify-content: center;
     color: #666; font-size: 14px;
   }
+
+  /* Sound source localization overlay */
+  #sound-overlay {
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    pointer-events: none;
+    display: none;
+    z-index: 5;
+  }
+  #sound-info {
+    position: absolute;
+    bottom: 8px; right: 8px;
+    background: rgba(0,0,0,0.65);
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 10px;
+    padding: 5px 10px;
+    font-size: 10px;
+    color: rgba(255,255,255,0.85);
+    display: none;
+    z-index: 6;
+    pointer-events: none;
+    line-height: 1.5;
+    max-width: 160px;
+  }
+  #sound-info.active { display: block; }
+  #btn-sound.toggled { color: #ff6b35; }
 </style>
 </head>
 <body>
@@ -343,6 +369,7 @@
     <button class="icon-btn" id="btn-close-cam" title="닫기">✕</button>
     <div class="title">DocScan</div>
     <div style="display:flex; align-items:center;">
+      <button class="icon-btn" id="btn-sound" title="소리 근원지 추적">🎙️</button>
       <button class="icon-btn" id="btn-gallery" title="갤러리에서 가져오기">🖼️</button>
       <button class="icon-btn" id="btn-flip" title="카메라 전환">⟲</button>
     </div>
@@ -352,6 +379,8 @@
   <div id="cam-stage">
     <video id="video" autoplay playsinline muted></video>
     <svg id="live-overlay"></svg>
+    <canvas id="sound-overlay"></canvas>
+    <div id="sound-info"></div>
   </div>
   <div class="cam-bottom">
     <div class="thumb-preview" id="thumb-preview">
@@ -660,6 +689,281 @@ $('btn-flip').onclick = () => {
 };
 
 $('btn-shutter').onclick = captureFrame;
+
+/* ---------- Sound Source Localization ----------
+   Uses GCC (Generalized Cross-Correlation) between all available
+   microphones to estimate the direction of a sound source, then
+   renders a heat-map spotlight on the live camera canvas overlay.
+
+   Physical model: assumes the two primary mics are arranged roughly
+   top-to-bottom on the device (≈150 mm apart). The TDOA (Time
+   Difference of Arrival) gives sin(θ) = tdoa·c/d, which maps to a
+   vertical bias on the overlay. When a third mic is present it also
+   resolves a horizontal component using the second mic pair.
+
+   Because the browser cannot guarantee identical timestamps across
+   separate getUserMedia streams, the cross-correlation is treated as
+   a best-effort estimate; energy-level weighting provides a fallback
+   that is always reliable. */
+
+const snd = {
+  active: false,
+  ctx: null,       // AudioContext
+  mics: [],        // [{deviceId, label, stream, src, an, buf}]
+  raf: null,
+  canvas: null,
+  g: null,
+  sx: 0.5, sy: 0.5, sl: 0,  // smoothed x/y/level
+};
+
+async function sndStart() {
+  if (snd.active) return;
+  try {
+    // Permission probe — must be inside a user-gesture handler.
+    const probe = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    probe.getTracks().forEach(t => t.stop());
+
+    const all = await navigator.mediaDevices.enumerateDevices();
+    const micDevs = all.filter(d => d.kind === 'audioinput');
+
+    snd.ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+    snd.mics = [];
+
+    for (const dev of micDevs) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            deviceId: { exact: dev.deviceId },
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+          },
+          video: false,
+        });
+        const src = snd.ctx.createMediaStreamSource(stream);
+        const an  = snd.ctx.createAnalyser();
+        an.fftSize = 1024;
+        an.smoothingTimeConstant = 0;
+        src.connect(an);
+        snd.mics.push({
+          deviceId: dev.deviceId,
+          label: dev.label || `마이크 ${snd.mics.length + 1}`,
+          stream, src, an,
+          buf: new Float32Array(an.fftSize),
+        });
+      } catch (_) { /* mic unavailable on this device */ }
+    }
+
+    if (snd.mics.length === 0) {
+      toast('마이크를 열 수 없습니다', 3000);
+      snd.ctx.close(); snd.ctx = null;
+      return;
+    }
+
+    snd.canvas = $('sound-overlay');
+    snd.g = snd.canvas.getContext('2d');
+    snd.canvas.style.display = 'block';
+    snd.sx = 0.5; snd.sy = 0.5; snd.sl = 0;
+    snd.active = true;
+    sndRender();
+
+    $('btn-sound').classList.add('toggled');
+    sndUpdateInfo();
+    toast(`🎙️ 소리 추적 시작 (${snd.mics.length}개 마이크)`);
+  } catch (e) {
+    toast('마이크 오류: ' + (e.message || e), 3000);
+    sndStop();
+  }
+}
+
+function sndStop() {
+  snd.active = false;
+  if (snd.raf) { cancelAnimationFrame(snd.raf); snd.raf = null; }
+  snd.mics.forEach(m => {
+    try { m.src.disconnect(); } catch (_) {}
+    try { m.stream.getTracks().forEach(t => t.stop()); } catch (_) {}
+  });
+  snd.mics = [];
+  if (snd.ctx) { snd.ctx.close().catch(() => {}); snd.ctx = null; }
+  if (snd.canvas) {
+    snd.g.clearRect(0, 0, snd.canvas.width, snd.canvas.height);
+    snd.canvas.style.display = 'none';
+  }
+  $('btn-sound').classList.remove('toggled');
+  const info = $('sound-info');
+  info.textContent = '';
+  info.classList.remove('active');
+}
+
+function sndUpdateInfo() {
+  const info = $('sound-info');
+  if (!snd.active) { info.classList.remove('active'); return; }
+  info.innerHTML = snd.mics.map((m, i) =>
+    `<span style="display:block">${m.label.slice(0,18)}</span>`
+  ).join('');
+  info.classList.add('active');
+}
+
+// Normalized cross-correlation; returns best lag in samples.
+// maxD is derived from d_max/c*sampleRate so we only search physically
+// meaningful delays (no point searching beyond the device's width).
+function sndNCC(a, b, maxD) {
+  let ra = 0, rb = 0;
+  for (let i = 0; i < a.length; i++) { ra += a[i]*a[i]; rb += b[i]*b[i]; }
+  ra = Math.sqrt(ra / a.length);
+  rb = Math.sqrt(rb / b.length);
+  if (ra < 1e-7 || rb < 1e-7) return 0; // silence → no estimate
+
+  let bestLag = 0, bestVal = -Infinity;
+  const norm = a.length * ra * rb;
+  for (let d = -maxD; d <= maxD; d++) {
+    let s = 0;
+    const lo = d < 0 ? -d : 0;
+    const hi = d < 0 ? a.length : a.length - d;
+    for (let i = lo; i < hi; i++) s += a[i] * b[i + d];
+    const v = s / norm;
+    if (v > bestVal) { bestVal = v; bestLag = d; }
+  }
+  return bestLag;
+}
+
+function sndRender() {
+  if (!snd.active) return;
+
+  const stage = $('cam-stage');
+  const W = stage.offsetWidth, H = stage.offsetHeight;
+  if (snd.canvas.width !== W || snd.canvas.height !== H) {
+    snd.canvas.width = W; snd.canvas.height = H;
+  }
+  const g = snd.g;
+  g.clearRect(0, 0, W, H);
+
+  const mics = snd.mics;
+  if (!mics.length) { snd.raf = requestAnimationFrame(sndRender); return; }
+
+  // Collect time-domain samples + RMS for each mic.
+  const rms = mics.map(m => {
+    m.an.getFloatTimeDomainData(m.buf);
+    let s = 0;
+    for (let i = 0; i < m.buf.length; i++) s += m.buf[i] * m.buf[i];
+    return Math.sqrt(s / m.buf.length);
+  });
+  const maxRms = Math.max(...rms);
+  const sumRms = rms.reduce((a, b) => a + b, 0);
+
+  // ---- Direction estimation ----
+  // Default to screen center; refine with TDOA and energy weighting.
+  let tgtX = 0.5, tgtY = 0.5;
+
+  if (mics.length >= 2 && sumRms > 5e-5) {
+    const sr = snd.ctx.sampleRate;
+    // Max physical delay for a ~20 cm device: 0.20 m / 343 m·s⁻¹ × sr
+    const maxD = Math.ceil(0.20 / 343 * sr);
+
+    // Primary pair (assume top/bottom layout).
+    const lag01 = sndNCC(mics[0].buf, mics[1].buf, maxD);
+    const tdoa01 = lag01 / sr;
+    // sin θ = tdoa · c / d_mic  (d_mic assumed 0.15 m)
+    const sinV = Math.min(1, Math.max(-1, tdoa01 * 343 / 0.15));
+    // lag > 0 → mic0 receives first → source closer to mic0 → top half
+    tgtY = 0.5 - sinV * 0.42;
+
+    // Second pair for horizontal axis when a third mic exists.
+    if (mics.length >= 3) {
+      const lag12 = sndNCC(mics[1].buf, mics[2].buf, maxD);
+      const sinH = Math.min(1, Math.max(-1, (lag12 / sr) * 343 / 0.15));
+      tgtX = 0.5 + sinH * 0.42;
+    }
+
+    // Blend in energy-ratio bias (robust fallback when TDOA is noisy).
+    if (sumRms > 1e-5) {
+      const bias = (rms[0] - rms[1]) / (rms[0] + rms[1]);
+      tgtY = tgtY * 0.6 + (0.5 - bias * 0.42) * 0.4;
+    }
+  }
+
+  // Exponential smoothing.
+  const alpha = 0.13;
+  snd.sx += alpha * (tgtX - snd.sx);
+  snd.sy += alpha * (tgtY - snd.sy);
+  snd.sl += 0.18 * (maxRms - snd.sl);
+
+  const normL = Math.min(1, snd.sl * 28);
+
+  // ---- Draw heat-map spotlight ----
+  if (normL > 0.008) {
+    const cx = snd.sx * W, cy = snd.sy * H;
+    const minDim = Math.min(W, H);
+    const innerR = minDim * 0.06;
+    const outerR = minDim * 0.18 + minDim * 0.50 * normL;
+
+    // Background heat gradient.
+    const grad = g.createRadialGradient(cx, cy, innerR, cx, cy, outerR);
+    const aOuter = Math.min(0.65, normL * 0.70);
+    const aInner = Math.min(0.85, normL * 0.90);
+    grad.addColorStop(0,   `hsla(15,100%,58%,${aInner})`);
+    grad.addColorStop(0.25,`hsla(25,100%,55%,${aOuter * 0.7})`);
+    grad.addColorStop(0.6, `hsla(40,100%,60%,${aOuter * 0.3})`);
+    grad.addColorStop(1,   `hsla(50,100%,65%,0)`);
+    g.fillStyle = grad;
+    g.fillRect(0, 0, W, H);
+
+    // Bright center dot.
+    const dotR = Math.max(8, innerR * 0.7);
+    g.beginPath();
+    g.arc(cx, cy, dotR, 0, Math.PI * 2);
+    const dotGrad = g.createRadialGradient(cx, cy, 0, cx, cy, dotR);
+    dotGrad.addColorStop(0, `rgba(255,255,255,${Math.min(0.95, aInner + 0.1)})`);
+    dotGrad.addColorStop(1, `rgba(255,100,20,${aInner})`);
+    g.fillStyle = dotGrad;
+    g.fill();
+
+    // Pulsing ring proportional to level.
+    g.beginPath();
+    g.arc(cx, cy, innerR + (outerR - innerR) * 0.25, 0, Math.PI * 2);
+    g.strokeStyle = `rgba(255,160,60,${aOuter * 0.6})`;
+    g.lineWidth = 1.5;
+    g.stroke();
+  }
+
+  // ---- Per-mic level bars (bottom-right corner) ----
+  const bW = 52, bH = 5, gap = 7;
+  const bX = W - bW - 14;
+  const bY0 = H - 14 - mics.length * (bH + gap);
+  mics.forEach((m, i) => {
+    const bx = bX, by = bY0 + i * (bH + gap);
+    // Track background.
+    g.fillStyle = 'rgba(0,0,0,0.5)';
+    g.beginPath();
+    if (g.roundRect) g.roundRect(bx, by, bW, bH, 2);
+    else g.rect(bx, by, bW, bH);
+    g.fill();
+    // Filled portion.
+    const lv = Math.min(1, rms[i] * 28);
+    if (lv > 0) {
+      const hue = lv > 0.72 ? 0 : lv > 0.38 ? 32 : 115;
+      g.fillStyle = `hsla(${hue},100%,58%,0.92)`;
+      g.beginPath();
+      if (g.roundRect) g.roundRect(bx, by, bW * lv, bH, 2);
+      else g.rect(bx, by, bW * lv, bH);
+      g.fill();
+    }
+    // Mic label to the left of the bar.
+    const label = m.label.length > 14 ? m.label.slice(0, 12) + '…' : m.label;
+    g.fillStyle = 'rgba(255,255,255,0.65)';
+    g.font = '9px -apple-system,BlinkMacSystemFont,sans-serif';
+    g.textAlign = 'right';
+    g.fillText(label, bx - 3, by + bH);
+    g.textAlign = 'left';
+  });
+
+  snd.raf = requestAnimationFrame(sndRender);
+}
+
+$('btn-sound').onclick = () => {
+  if (snd.active) { sndStop(); toast('소리 추적 종료'); }
+  else sndStart();
+};
 
 // Capture quality: 0.96 strikes a balance between visual quality and file
 // size for JPEG. We keep the original sensor resolution.
@@ -2407,7 +2711,7 @@ refreshThumb();
 refreshPagesUI();
 startCamera();
 
-window.addEventListener('beforeunload', stopCamera);
+window.addEventListener('beforeunload', () => { stopCamera(); sndStop(); });
 
 // Keep the crop view's pixel↔display mapping in sync when the device
 // rotates or the window resizes. We recompute the image's layout box
