@@ -333,6 +333,101 @@
     flex: 1; display: flex; align-items: center; justify-content: center;
     color: #666; font-size: 14px;
   }
+
+  /* Sound source localization overlay */
+  #sound-overlay {
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    pointer-events: none;
+    display: none;
+    z-index: 5;
+  }
+  #sound-info {
+    position: absolute;
+    bottom: 8px; right: 8px;
+    background: rgba(0,0,0,0.65);
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 10px;
+    padding: 5px 10px;
+    font-size: 10px;
+    color: rgba(255,255,255,0.85);
+    display: none;
+    z-index: 6;
+    pointer-events: none;
+    line-height: 1.5;
+    max-width: 160px;
+  }
+  #sound-info.active { display: block; }
+  #btn-sound.toggled { color: #ff6b35; }
+
+  /* Sound control toolbar (shown when sound mode is active) */
+  #sound-ctrl-bar {
+    display: none;
+    flex-shrink: 0;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-around;
+    padding: 6px 10px;
+    background: rgba(10,10,10,0.96);
+    border-top: 1px solid #1e1e1e;
+    gap: 6px;
+    z-index: 10;
+  }
+  #sound-ctrl-bar.active { display: flex; }
+  .snd-btn {
+    flex: 1;
+    background: #161616;
+    border: 1px solid #2a2a2a;
+    color: #aaa;
+    border-radius: 14px;
+    padding: 7px 4px;
+    font-size: 11px;
+    font-weight: 500;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    transition: background 0.1s, color 0.12s, border-color 0.12s;
+    white-space: nowrap;
+  }
+  .snd-btn:active { background: #222; }
+  .snd-btn.toggled { background: rgba(255,140,0,0.12); border-color: #ff8c00; color: #ff8c00; }
+  .snd-btn.active-state { background: rgba(78,161,255,0.12); border-color: #4ea1ff; color: #4ea1ff; }
+
+  /* Frequency spectrum graph panel */
+  #sound-freq-panel {
+    display: none;
+    flex-shrink: 0;
+    height: 96px;
+    background: #080808;
+    border-top: 1px solid #1a1a1a;
+    position: relative;
+    overflow: hidden;
+    touch-action: none;
+    user-select: none;
+  }
+  #sound-freq-panel.active { display: block; }
+  #sound-freq-canvas { display: block; }
+
+  /* dB level floating display */
+  #sound-db-display {
+    position: absolute;
+    top: 10px; left: 10px;
+    background: rgba(0,0,0,0.7);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 8px;
+    padding: 4px 10px;
+    font-size: 18px;
+    font-weight: 700;
+    color: #ff8c00;
+    font-variant-numeric: tabular-nums;
+    pointer-events: none;
+    display: none;
+    z-index: 7;
+    letter-spacing: 0.5px;
+  }
+  #sound-db-display.active { display: block; }
 </style>
 </head>
 <body>
@@ -343,6 +438,7 @@
     <button class="icon-btn" id="btn-close-cam" title="닫기">✕</button>
     <div class="title">DocScan</div>
     <div style="display:flex; align-items:center;">
+      <button class="icon-btn" id="btn-sound" title="소리 근원지 추적">🎙️</button>
       <button class="icon-btn" id="btn-gallery" title="갤러리에서 가져오기">🖼️</button>
       <button class="icon-btn" id="btn-flip" title="카메라 전환">⟲</button>
     </div>
@@ -352,6 +448,21 @@
   <div id="cam-stage">
     <video id="video" autoplay playsinline muted></video>
     <svg id="live-overlay"></svg>
+    <canvas id="sound-overlay"></canvas>
+    <div id="sound-info"></div>
+    <div id="sound-db-display"></div>
+  </div>
+  <!-- Sound control toolbar: visible only when 🎙️ mode is active -->
+  <div id="sound-ctrl-bar">
+    <button class="snd-btn" id="snd-auto" title="주파수 자동 고정">🔒 자동고정</button>
+    <button class="snd-btn" id="snd-db" title="데시벨 표시">📊 dB</button>
+    <button class="snd-btn" id="snd-opacity" title="투명도 조절">◑ 투명도</button>
+    <button class="snd-btn" id="snd-graph" title="주파수 그래프">📈 그래프</button>
+    <button class="snd-btn" id="snd-color" title="색상 변경">🔴 색상</button>
+  </div>
+  <!-- Frequency spectrum panel -->
+  <div id="sound-freq-panel">
+    <canvas id="sound-freq-canvas"></canvas>
   </div>
   <div class="cam-bottom">
     <div class="thumb-preview" id="thumb-preview">
@@ -660,6 +771,575 @@ $('btn-flip').onclick = () => {
 };
 
 $('btn-shutter').onclick = captureFrame;
+
+/* ---------- Sound Source Localization ----------
+   Uses GCC (Generalized Cross-Correlation) between all available
+   microphones to estimate the direction of a sound source, then
+   renders a heat-map spotlight on the live camera canvas overlay.
+
+   Physical model: assumes the two primary mics are arranged roughly
+   top-to-bottom on the device (≈150 mm apart). The TDOA (Time
+   Difference of Arrival) gives sin(θ) = tdoa·c/d, which maps to a
+   vertical bias on the overlay. When a third mic is present it also
+   resolves a horizontal component using the second mic pair.
+
+   Because the browser cannot guarantee identical timestamps across
+   separate getUserMedia streams, the cross-correlation is treated as
+   a best-effort estimate; energy-level weighting provides a fallback
+   that is always reliable. */
+
+const snd = {
+  active: false,
+  ctx: null,
+  mics: [],
+  raf: null,
+  canvas: null,
+  g: null,
+  sx: 0.5, sy: 0.5, sl: 0,
+  // Extended state for acoustic camera features
+  colorScheme: 'red',     // 'gray' | 'red' | 'rainbow'
+  overlayOpacity: 0.75,   // 0..1
+  showGraph: true,
+  showDb: false,
+  freqLocked: false,
+  freqLo: 2000,           // Hz — low cut of selected band
+  freqHi: 8000,           // Hz — high cut of selected band
+  peakDb: -Infinity,
+  freqDrag: null,         // pointer drag state for freq graph
+};
+
+async function sndStart() {
+  if (snd.active) return;
+  try {
+    // Permission probe — must be inside a user-gesture handler.
+    const probe = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    probe.getTracks().forEach(t => t.stop());
+
+    const all = await navigator.mediaDevices.enumerateDevices();
+    const micDevs = all.filter(d => d.kind === 'audioinput');
+
+    snd.ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+    snd.mics = [];
+
+    for (const dev of micDevs) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            deviceId: { exact: dev.deviceId },
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+          },
+          video: false,
+        });
+        const src = snd.ctx.createMediaStreamSource(stream);
+        const an  = snd.ctx.createAnalyser();
+        an.fftSize = 1024;
+        an.smoothingTimeConstant = 0;
+        src.connect(an);
+        snd.mics.push({
+          deviceId: dev.deviceId,
+          label: dev.label || `마이크 ${snd.mics.length + 1}`,
+          stream, src, an,
+          buf: new Float32Array(an.fftSize),
+          freqBuf: new Float32Array(an.frequencyBinCount),
+        });
+      } catch (_) { /* mic unavailable on this device */ }
+    }
+
+    if (snd.mics.length === 0) {
+      toast('마이크를 열 수 없습니다', 3000);
+      snd.ctx.close(); snd.ctx = null;
+      return;
+    }
+
+    snd.canvas = $('sound-overlay');
+    snd.g = snd.canvas.getContext('2d');
+    snd.canvas.style.display = 'block';
+    snd.sx = 0.5; snd.sy = 0.5; snd.sl = 0;
+    snd.peakDb = -Infinity;
+    snd.active = true;
+    sndRender();
+
+    $('btn-sound').classList.add('toggled');
+    $('sound-ctrl-bar').classList.add('active');
+    sndUpdateGraphPanel();
+    sndUpdateDbDisplay();
+    sndUpdateInfo();
+    toast(`🎙️ 소리 추적 시작 (${snd.mics.length}개 마이크)`);
+  } catch (e) {
+    toast('마이크 오류: ' + (e.message || e), 3000);
+    sndStop();
+  }
+}
+
+function sndStop() {
+  snd.active = false;
+  if (snd.raf) { cancelAnimationFrame(snd.raf); snd.raf = null; }
+  snd.mics.forEach(m => {
+    try { m.src.disconnect(); } catch (_) {}
+    try { m.stream.getTracks().forEach(t => t.stop()); } catch (_) {}
+  });
+  snd.mics = [];
+  if (snd.ctx) { snd.ctx.close().catch(() => {}); snd.ctx = null; }
+  if (snd.canvas) {
+    snd.g.clearRect(0, 0, snd.canvas.width, snd.canvas.height);
+    snd.canvas.style.display = 'none';
+  }
+  $('btn-sound').classList.remove('toggled');
+  $('sound-ctrl-bar').classList.remove('active');
+  $('sound-freq-panel').classList.remove('active');
+  $('sound-db-display').classList.remove('active');
+  const info = $('sound-info');
+  info.textContent = '';
+  info.classList.remove('active');
+  // Reset toggle button states
+  ['snd-auto','snd-db','snd-graph'].forEach(id => {
+    const el = $(id); if (el) el.classList.remove('toggled','active-state');
+  });
+}
+
+function sndUpdateInfo() {
+  const info = $('sound-info');
+  if (!snd.active) { info.classList.remove('active'); return; }
+  info.innerHTML = snd.mics.map((m, i) =>
+    `<span style="display:block">${m.label.slice(0,18)}</span>`
+  ).join('');
+  info.classList.add('active');
+}
+
+// Normalized cross-correlation; returns best lag in samples.
+// maxD is derived from d_max/c*sampleRate so we only search physically
+// meaningful delays (no point searching beyond the device's width).
+function sndNCC(a, b, maxD) {
+  let ra = 0, rb = 0;
+  for (let i = 0; i < a.length; i++) { ra += a[i]*a[i]; rb += b[i]*b[i]; }
+  ra = Math.sqrt(ra / a.length);
+  rb = Math.sqrt(rb / b.length);
+  if (ra < 1e-7 || rb < 1e-7) return 0; // silence → no estimate
+
+  let bestLag = 0, bestVal = -Infinity;
+  const norm = a.length * ra * rb;
+  for (let d = -maxD; d <= maxD; d++) {
+    let s = 0;
+    const lo = d < 0 ? -d : 0;
+    const hi = d < 0 ? a.length : a.length - d;
+    for (let i = lo; i < hi; i++) s += a[i] * b[i + d];
+    const v = s / norm;
+    if (v > bestVal) { bestVal = v; bestLag = d; }
+  }
+  return bestLag;
+}
+
+function sndRender() {
+  if (!snd.active) return;
+
+  const stage = $('cam-stage');
+  const W = stage.offsetWidth, H = stage.offsetHeight;
+  if (snd.canvas.width !== W || snd.canvas.height !== H) {
+    snd.canvas.width = W; snd.canvas.height = H;
+  }
+  const g = snd.g;
+  g.clearRect(0, 0, W, H);
+
+  const mics = snd.mics;
+  if (!mics.length) { snd.raf = requestAnimationFrame(sndRender); return; }
+
+  const sr = snd.ctx.sampleRate;
+  const freqBins = mics[0].an.frequencyBinCount;
+  const binLo = Math.max(0, Math.floor(snd.freqLo / (sr / 2) * freqBins));
+  const binHi = Math.min(freqBins - 1, Math.ceil(snd.freqHi / (sr / 2) * freqBins));
+
+  // Gather time-domain + frequency-domain samples from every mic.
+  const rmsRaw = [], bandE = [];
+  mics.forEach(m => {
+    m.an.getFloatTimeDomainData(m.buf);
+    m.an.getFloatFrequencyData(m.freqBuf);
+
+    let s = 0;
+    for (let i = 0; i < m.buf.length; i++) s += m.buf[i] * m.buf[i];
+    rmsRaw.push(Math.sqrt(s / m.buf.length));
+
+    let be = 0;
+    for (let b = binLo; b <= binHi; b++) {
+      const lin = Math.pow(10, m.freqBuf[b] / 20);
+      be += lin * lin;
+    }
+    const bCount = binHi - binLo + 1;
+    bandE.push(bCount > 0 ? Math.sqrt(be / bCount) : 0);
+  });
+
+  const maxBand = Math.max(...bandE);
+  const sumBand = bandE.reduce((a, b) => a + b, 0);
+  if (maxBand > 0) snd.peakDb = 20 * Math.log10(maxBand);
+
+  // ---- Direction estimation using TDOA + band-energy weighting ----
+  let tgtX = 0.5, tgtY = 0.5;
+  if (mics.length >= 2 && sumBand > 1e-8) {
+    const maxD = Math.ceil(0.20 / 343 * sr);
+    const lag01 = sndNCC(mics[0].buf, mics[1].buf, maxD);
+    const sinV = Math.min(1, Math.max(-1, (lag01 / sr) * 343 / 0.15));
+    tgtY = 0.5 - sinV * 0.42;
+
+    if (mics.length >= 3) {
+      const lag12 = sndNCC(mics[1].buf, mics[2].buf, maxD);
+      const sinH = Math.min(1, Math.max(-1, (lag12 / sr) * 343 / 0.15));
+      tgtX = 0.5 + sinH * 0.42;
+    }
+    // Blend energy-ratio bias as a robust fallback.
+    const bias = (bandE[0] - bandE[1]) / (bandE[0] + bandE[1] + 1e-12);
+    tgtY = tgtY * 0.55 + (0.5 - bias * 0.42) * 0.45;
+  }
+
+  const alpha = 0.13;
+  snd.sx += alpha * (tgtX - snd.sx);
+  snd.sy += alpha * (tgtY - snd.sy);
+  snd.sl += 0.18 * (maxBand - snd.sl);
+  const normL = Math.min(1, snd.sl * 240);
+
+  // ---- Heat-map spotlight (color-scheme + opacity aware) ----
+  if (normL > 0.005) {
+    const cx = snd.sx * W, cy = snd.sy * H;
+    const minDim = Math.min(W, H);
+    const innerR = minDim * 0.06;
+    const outerR = minDim * 0.18 + minDim * 0.50 * normL;
+    const op = snd.overlayOpacity;
+    const aO = Math.min(op * 0.80, normL * op * 0.80);
+    const aI = Math.min(op,        normL * op);
+
+    const grad = g.createRadialGradient(cx, cy, innerR, cx, cy, outerR);
+    switch (snd.colorScheme) {
+      case 'gray':
+        grad.addColorStop(0,    `rgba(255,255,255,${aI})`);
+        grad.addColorStop(0.4,  `rgba(160,160,160,${aO * 0.6})`);
+        grad.addColorStop(1,    `rgba(60,60,60,0)`);
+        break;
+      case 'rainbow':
+        grad.addColorStop(0,    `hsla(0,100%,55%,${aI})`);
+        grad.addColorStop(0.25, `hsla(30,100%,55%,${aO * 0.7})`);
+        grad.addColorStop(0.5,  `hsla(60,100%,52%,${aO * 0.4})`);
+        grad.addColorStop(0.75, `hsla(120,100%,42%,${aO * 0.18})`);
+        grad.addColorStop(1,    `hsla(240,100%,50%,0)`);
+        break;
+      default: // 'red'
+        grad.addColorStop(0,    `hsla(15,100%,58%,${aI})`);
+        grad.addColorStop(0.25, `hsla(25,100%,55%,${aO * 0.7})`);
+        grad.addColorStop(0.6,  `hsla(40,100%,60%,${aO * 0.28})`);
+        grad.addColorStop(1,    `hsla(50,100%,65%,0)`);
+    }
+    g.fillStyle = grad;
+    g.fillRect(0, 0, W, H);
+
+    // Center dot
+    const dotR = Math.max(7, innerR * 0.72);
+    g.beginPath();
+    g.arc(cx, cy, dotR, 0, Math.PI * 2);
+    const dg = g.createRadialGradient(cx, cy, 0, cx, cy, dotR);
+    dg.addColorStop(0, `rgba(255,255,255,${Math.min(0.95, aI + 0.12)})`);
+    dg.addColorStop(1, snd.colorScheme === 'gray'
+      ? `rgba(180,180,180,${aI})` : `rgba(255,90,10,${aI})`);
+    g.fillStyle = dg;
+    g.fill();
+
+    // Pulsing ring
+    g.beginPath();
+    g.arc(cx, cy, innerR + (outerR - innerR) * 0.22, 0, Math.PI * 2);
+    g.strokeStyle = `rgba(255,180,60,${aO * 0.5})`;
+    g.lineWidth = 1.5;
+    g.stroke();
+  }
+
+  // ---- Per-mic level bars (bottom-right) ----
+  const bW = 52, bH = 5, gap = 7;
+  const bX = W - bW - 14, bY0 = H - 14 - mics.length * (bH + gap);
+  mics.forEach((m, i) => {
+    const bx = bX, by = bY0 + i * (bH + gap);
+    g.fillStyle = 'rgba(0,0,0,0.5)';
+    g.beginPath();
+    if (g.roundRect) g.roundRect(bx, by, bW, bH, 2); else g.rect(bx, by, bW, bH);
+    g.fill();
+    const lv = Math.min(1, rmsRaw[i] * 28);
+    if (lv > 0) {
+      g.fillStyle = `hsla(${lv > 0.72 ? 0 : lv > 0.38 ? 32 : 115},100%,58%,0.9)`;
+      g.beginPath();
+      if (g.roundRect) g.roundRect(bx, by, bW * lv, bH, 2); else g.rect(bx, by, bW * lv, bH);
+      g.fill();
+    }
+    const lbl = m.label.length > 14 ? m.label.slice(0, 12) + '…' : m.label;
+    g.fillStyle = 'rgba(255,255,255,0.6)';
+    g.font = '9px -apple-system,sans-serif';
+    g.textAlign = 'right';
+    g.fillText(lbl, bx - 3, by + bH);
+    g.textAlign = 'left';
+  });
+
+  // Update frequency graph and dB overlay.
+  sndDrawFreq();
+  if (snd.showDb && isFinite(snd.peakDb)) {
+    const dbEl = $('sound-db-display');
+    dbEl.textContent = snd.peakDb.toFixed(1) + ' dB';
+  }
+
+  snd.raf = requestAnimationFrame(sndRender);
+}
+
+/* ---- Frequency graph helpers ---- */
+
+// Map Hz ↔ pixel-X on the spectrum canvas (log scale, 20 Hz … min(sr/2, 20kHz)).
+function sndFreqToX(f, W) {
+  const fMin = 20, fMax = Math.min(
+    snd.ctx ? snd.ctx.sampleRate / 2 : 20000, 20000
+  );
+  return (Math.log10(f / fMin) / Math.log10(fMax / fMin)) * W;
+}
+function sndXToFreq(x, W) {
+  const fMin = 20, fMax = Math.min(
+    snd.ctx ? snd.ctx.sampleRate / 2 : 20000, 20000
+  );
+  return fMin * Math.pow(fMax / fMin, x / W);
+}
+
+function sndUpdateGraphPanel() {
+  const panel = $('sound-freq-panel');
+  if (snd.active && snd.showGraph) panel.classList.add('active');
+  else panel.classList.remove('active');
+}
+
+function sndUpdateDbDisplay() {
+  const el = $('sound-db-display');
+  if (snd.active && snd.showDb) el.classList.add('active');
+  else el.classList.remove('active');
+}
+
+function sndDrawFreq() {
+  if (!snd.active || !snd.showGraph) return;
+  const panel = $('sound-freq-panel');
+  const canvas = $('sound-freq-canvas');
+  const W = panel.offsetWidth || 320;
+  const H = panel.offsetHeight || 96;
+  if (canvas.width !== W || canvas.height !== H) { canvas.width = W; canvas.height = H; }
+  const g = canvas.getContext('2d');
+  if (!snd.mics.length) return;
+
+  const sr = snd.ctx.sampleRate;
+  const freqBins = snd.mics[0].an.frequencyBinCount;
+  const fMin = 20, fMax = Math.min(sr / 2, 20000);
+  const logFMin = Math.log10(fMin), logFMax = Math.log10(fMax);
+  const dbMin = -80, dbMax = 0;
+
+  // Average FFT across all mics.
+  const combined = new Float32Array(freqBins);
+  const tmp = new Float32Array(freqBins);
+  snd.mics.forEach(m => {
+    // freqBuf was already filled this frame in sndRender.
+    for (let i = 0; i < freqBins; i++) combined[i] += m.freqBuf[i];
+  });
+  for (let i = 0; i < freqBins; i++) combined[i] /= snd.mics.length;
+
+  // Background
+  g.clearRect(0, 0, W, H);
+  g.fillStyle = '#080808';
+  g.fillRect(0, 0, W, H);
+
+  // Grid lines at standard octave frequencies
+  const gridFreqs = [50,100,200,500,1000,2000,5000,10000,20000].filter(f => f > fMin && f < fMax);
+  g.strokeStyle = 'rgba(255,255,255,0.06)';
+  g.lineWidth = 1;
+  gridFreqs.forEach(f => {
+    const x = (Math.log10(f) - logFMin) / (logFMax - logFMin) * W;
+    g.beginPath(); g.moveTo(x, 0); g.lineTo(x, H - 12); g.stroke();
+  });
+
+  // Spectrum line
+  g.beginPath();
+  g.strokeStyle = '#4ea1ff';
+  g.lineWidth = 1.5;
+  let first = true;
+  for (let px = 0; px < W; px++) {
+    const logF = logFMin + (px / W) * (logFMax - logFMin);
+    const f = Math.pow(10, logF);
+    const bin = Math.min(freqBins - 1, Math.round(f / (sr / 2) * freqBins));
+    const db = combined[bin];
+    const y = H - 12 - Math.max(0, (db - dbMin) / (dbMax - dbMin)) * (H - 14);
+    first ? (g.moveTo(px, y), first = false) : g.lineTo(px, y);
+  }
+  g.stroke();
+
+  // Fill under spectrum
+  g.lineTo(W - 1, H - 12); g.lineTo(0, H - 12); g.closePath();
+  g.fillStyle = 'rgba(78,161,255,0.07)';
+  g.fill();
+
+  // Selected frequency band highlight
+  const xLo = sndFreqToX(snd.freqLo, W);
+  const xHi = sndFreqToX(snd.freqHi, W);
+  g.fillStyle = 'rgba(255,120,0,0.14)';
+  g.fillRect(xLo, 0, xHi - xLo, H - 12);
+
+  g.strokeStyle = 'rgba(255,140,0,0.75)';
+  g.lineWidth = 1.5;
+  g.setLineDash([4, 3]);
+  g.beginPath(); g.moveTo(xLo, 0); g.lineTo(xLo, H - 12); g.stroke();
+  g.beginPath(); g.moveTo(xHi, 0); g.lineTo(xHi, H - 12); g.stroke();
+  g.setLineDash([]);
+
+  // Drag handles (triangles at top)
+  [[xLo, '◀'], [xHi, '▶']].forEach(([x, lbl]) => {
+    g.fillStyle = 'rgba(255,140,0,0.9)';
+    g.beginPath(); g.arc(x, 5, 4, 0, Math.PI * 2); g.fill();
+  });
+
+  // Frequency labels on x-axis
+  g.fillStyle = 'rgba(255,255,255,0.45)';
+  g.font = '8px -apple-system,sans-serif';
+  g.textAlign = 'center';
+  gridFreqs.forEach(f => {
+    const x = (Math.log10(f) - logFMin) / (logFMax - logFMin) * W;
+    const lbl = f >= 1000 ? (f / 1000) + 'k' : String(f);
+    g.fillText(lbl, x, H - 2);
+  });
+
+  // Selected band label
+  const loStr = snd.freqLo >= 1000 ? (snd.freqLo/1000).toFixed(1)+'k' : snd.freqLo;
+  const hiStr = snd.freqHi >= 1000 ? (snd.freqHi/1000).toFixed(1)+'k' : snd.freqHi;
+  g.fillStyle = 'rgba(255,160,60,0.9)';
+  g.font = 'bold 9px -apple-system,sans-serif';
+  g.fillText(`${loStr}–${hiStr} Hz`, (xLo + xHi) / 2, 16);
+  if (snd.freqLocked) {
+    g.fillText('🔒', (xLo + xHi) / 2, 26);
+  }
+}
+
+/* ---- Auto-lock: find dominant frequency peak ---- */
+function sndAutoLock() {
+  if (!snd.active || !snd.mics.length) return;
+  const sr = snd.ctx.sampleRate;
+  const freqBins = snd.mics[0].an.frequencyBinCount;
+  // Use the averaged freqBuf from the last render frame.
+  const combined = new Float32Array(freqBins);
+  snd.mics.forEach(m => {
+    for (let i = 0; i < freqBins; i++) combined[i] += m.freqBuf[i];
+  });
+  // Find peak bin above 200 Hz.
+  const minBin = Math.floor(200 / (sr / 2) * freqBins);
+  let peakBin = minBin, peakVal = -Infinity;
+  for (let b = minBin; b < freqBins; b++) {
+    if (combined[b] > peakVal) { peakVal = combined[b]; peakBin = b; }
+  }
+  const peakHz = peakBin / freqBins * (sr / 2);
+  // Set selection to ±0.5 octave around peak.
+  snd.freqLo = Math.max(20, peakHz / Math.SQRT2);
+  snd.freqHi = Math.min(sr / 2, peakHz * Math.SQRT2);
+  snd.freqLocked = !snd.freqLocked;
+  $('snd-auto').classList.toggle('toggled', snd.freqLocked);
+  toast(snd.freqLocked
+    ? `🔒 ${Math.round(peakHz)} Hz 고정`
+    : '주파수 고정 해제');
+}
+
+/* ---- Frequency graph touch/pointer drag ---- */
+(function setupFreqDrag() {
+  const panel = $('sound-freq-panel');
+
+  function getRelX(e) {
+    const r = panel.getBoundingClientRect();
+    const cx = e.touches ? e.touches[0].clientX : e.clientX;
+    return cx - r.left;
+  }
+
+  function startDrag(e) {
+    if (!snd.active || snd.freqLocked) return;
+    const W = panel.offsetWidth;
+    const x = getRelX(e);
+    const xLo = sndFreqToX(snd.freqLo, W);
+    const xHi = sndFreqToX(snd.freqHi, W);
+    const HANDLE = 16;
+    let side;
+    if (Math.abs(x - xLo) < HANDLE) side = 'lo';
+    else if (Math.abs(x - xHi) < HANDLE) side = 'hi';
+    else if (x > xLo && x < xHi) side = 'both';
+    else {
+      // Start a brand-new selection
+      const f = sndXToFreq(x, W);
+      snd.freqLo = snd.freqHi = f;
+      side = 'hi';
+    }
+    snd.freqDrag = { side, startX: x, startLo: snd.freqLo, startHi: snd.freqHi };
+    e.preventDefault();
+  }
+
+  function moveDrag(e) {
+    if (!snd.freqDrag) return;
+    const W = panel.offsetWidth;
+    const x = getRelX(e);
+    const dx = x - snd.freqDrag.startX;
+    const dHz = sndXToFreq(x, W) - sndXToFreq(snd.freqDrag.startX, W);
+    const { side, startLo, startHi } = snd.freqDrag;
+    const sr = snd.ctx ? snd.ctx.sampleRate / 2 : 20000;
+    if (side === 'lo') {
+      snd.freqLo = Math.max(20, Math.min(snd.freqHi - 50, startLo + dHz));
+    } else if (side === 'hi') {
+      snd.freqHi = Math.max(snd.freqLo + 50, Math.min(sr, startHi + dHz));
+    } else {
+      const newLo = startLo + dHz, newHi = startHi + dHz;
+      if (newLo >= 20 && newHi <= sr) { snd.freqLo = newLo; snd.freqHi = newHi; }
+    }
+    e.preventDefault();
+  }
+
+  function endDrag() { snd.freqDrag = null; }
+
+  panel.addEventListener('pointerdown', startDrag, { passive: false });
+  panel.addEventListener('pointermove', moveDrag, { passive: false });
+  panel.addEventListener('pointerup', endDrag);
+  panel.addEventListener('pointercancel', endDrag);
+  panel.addEventListener('touchstart', startDrag, { passive: false });
+  panel.addEventListener('touchmove', moveDrag, { passive: false });
+  panel.addEventListener('touchend', endDrag);
+})();
+
+/* ---- Control button handlers ---- */
+
+$('snd-auto').onclick = sndAutoLock;
+
+$('snd-db').onclick = () => {
+  snd.showDb = !snd.showDb;
+  $('snd-db').classList.toggle('active-state', snd.showDb);
+  sndUpdateDbDisplay();
+};
+
+const opacitySteps = [0.75, 0.50, 0.25, 1.0];
+let opacityIdx = 0;
+$('snd-opacity').onclick = () => {
+  opacityIdx = (opacityIdx + 1) % opacitySteps.length;
+  snd.overlayOpacity = opacitySteps[opacityIdx];
+  const pct = Math.round(snd.overlayOpacity * 100);
+  $('snd-opacity').textContent = `◑ ${pct}%`;
+  toast(`투명도 ${100 - pct}%`);
+};
+
+$('snd-graph').onclick = () => {
+  snd.showGraph = !snd.showGraph;
+  $('snd-graph').classList.toggle('active-state', snd.showGraph);
+  sndUpdateGraphPanel();
+};
+// Graph on by default.
+$('snd-graph').classList.add('active-state');
+
+const colorCycle = ['red', 'gray', 'rainbow'];
+const colorLabels = { red: '🔴 색상', gray: '⬜ 색상', rainbow: '🌈 색상' };
+let colorIdx = 0;
+$('snd-color').onclick = () => {
+  colorIdx = (colorIdx + 1) % colorCycle.length;
+  snd.colorScheme = colorCycle[colorIdx];
+  $('snd-color').textContent = colorLabels[snd.colorScheme];
+  toast(`색상: ${snd.colorScheme === 'red' ? '레드' : snd.colorScheme === 'gray' ? '그레이' : '레인보우'}`);
+};
+
+$('btn-sound').onclick = () => {
+  if (snd.active) { sndStop(); toast('소리 추적 종료'); }
+  else sndStart();
+};
 
 // Capture quality: 0.96 strikes a balance between visual quality and file
 // size for JPEG. We keep the original sensor resolution.
@@ -2407,7 +3087,7 @@ refreshThumb();
 refreshPagesUI();
 startCamera();
 
-window.addEventListener('beforeunload', stopCamera);
+window.addEventListener('beforeunload', () => { stopCamera(); sndStop(); });
 
 // Keep the crop view's pixel↔display mapping in sync when the device
 // rotates or the window resizes. We recompute the image's layout box
