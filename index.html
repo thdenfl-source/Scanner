@@ -950,8 +950,8 @@ function sndRender() {
   const binLo = Math.max(0, Math.floor(snd.freqLo / (sr / 2) * freqBins));
   const binHi = Math.min(freqBins - 1, Math.ceil(snd.freqHi / (sr / 2) * freqBins));
 
-  // Gather time-domain + frequency-domain samples from every mic.
-  const rmsRaw = [], bandE = [];
+  // Collect time-domain and frequency-domain data from every mic.
+  const rmsRaw = [], bandPeakDb = [];
   mics.forEach(m => {
     m.an.getFloatTimeDomainData(m.buf);
     m.an.getFloatFrequencyData(m.freqBuf);
@@ -960,96 +960,215 @@ function sndRender() {
     for (let i = 0; i < m.buf.length; i++) s += m.buf[i] * m.buf[i];
     rmsRaw.push(Math.sqrt(s / m.buf.length));
 
-    let be = 0;
+    // Peak dB in selected frequency band (more sensitive than average energy).
+    let peak = -150;
     for (let b = binLo; b <= binHi; b++) {
-      const lin = Math.pow(10, m.freqBuf[b] / 20);
-      be += lin * lin;
+      if (isFinite(m.freqBuf[b]) && m.freqBuf[b] > peak) peak = m.freqBuf[b];
     }
-    const bCount = binHi - binLo + 1;
-    bandE.push(bCount > 0 ? Math.sqrt(be / bCount) : 0);
+    bandPeakDb.push(peak);
   });
 
-  const maxBand = Math.max(...bandE);
-  const sumBand = bandE.reduce((a, b) => a + b, 0);
-  if (maxBand > 0) snd.peakDb = 20 * Math.log10(maxBand);
+  const maxPeakDb = Math.max(...bandPeakDb);
+  snd.peakDb = maxPeakDb;
 
-  // ---- Direction estimation using TDOA + band-energy weighting ----
+  // dB → 0..1 mapping: −70 dB (quiet room) → 0,  −10 dB (loud) → 1.
+  // This makes the overlay visible for normal ambient sounds.
+  const rawL = Math.max(0, Math.min(1, (maxPeakDb + 70) / 60));
+  snd.sl += 0.20 * (rawL - snd.sl);
+  const smoothL = snd.sl;
+
+  // ---- Direction estimation (dB difference primary, TDOA refinement) ----
   let tgtX = 0.5, tgtY = 0.5;
-  if (mics.length >= 2 && sumBand > 1e-8) {
-    const maxD = Math.ceil(0.20 / 343 * sr);
-    const lag01 = sndNCC(mics[0].buf, mics[1].buf, maxD);
-    const sinV = Math.min(1, Math.max(-1, (lag01 / sr) * 343 / 0.15));
-    tgtY = 0.5 - sinV * 0.42;
+  if (mics.length >= 2) {
+    // dB level difference between mic pair is the most robust direction cue.
+    // ±12 dB difference = full deflection (±0.45 from center).
+    const dbDiff01 = bandPeakDb[0] - bandPeakDb[1];
+    tgtY = 0.5 - Math.max(-0.45, Math.min(0.45, dbDiff01 / 24));
+
+    // Refine with TDOA cross-correlation when signal is audible.
+    if (rawL > 0.15) {
+      const maxD = Math.ceil(0.20 / 343 * sr);
+      const lag01 = sndNCC(mics[0].buf, mics[1].buf, maxD);
+      const sinV = Math.min(1, Math.max(-1, (lag01 / sr) * 343 / 0.15));
+      tgtY = tgtY * 0.55 + (0.5 - sinV * 0.45) * 0.45;
+    }
 
     if (mics.length >= 3) {
-      const lag12 = sndNCC(mics[1].buf, mics[2].buf, maxD);
-      const sinH = Math.min(1, Math.max(-1, (lag12 / sr) * 343 / 0.15));
-      tgtX = 0.5 + sinH * 0.42;
+      const dbDiff12 = bandPeakDb[1] - bandPeakDb[2];
+      tgtX = 0.5 + Math.max(-0.45, Math.min(0.45, dbDiff12 / 24));
     }
-    // Blend energy-ratio bias as a robust fallback.
-    const bias = (bandE[0] - bandE[1]) / (bandE[0] + bandE[1] + 1e-12);
-    tgtY = tgtY * 0.55 + (0.5 - bias * 0.42) * 0.45;
   }
 
-  const alpha = 0.13;
+  const alpha = 0.14;
   snd.sx += alpha * (tgtX - snd.sx);
   snd.sy += alpha * (tgtY - snd.sy);
-  snd.sl += 0.18 * (maxBand - snd.sl);
-  const normL = Math.min(1, snd.sl * 240);
 
-  // ---- Heat-map spotlight (color-scheme + opacity aware) ----
-  if (normL > 0.005) {
-    const cx = snd.sx * W, cy = snd.sy * H;
-    const minDim = Math.min(W, H);
-    const innerR = minDim * 0.06;
-    const outerR = minDim * 0.18 + minDim * 0.50 * normL;
-    const op = snd.overlayOpacity;
-    const aO = Math.min(op * 0.80, normL * op * 0.80);
-    const aI = Math.min(op,        normL * op);
+  const cx = snd.sx * W, cy = snd.sy * H;
+  const minDim = Math.min(W, H);
+  const op = snd.overlayOpacity;
 
-    const grad = g.createRadialGradient(cx, cy, innerR, cx, cy, outerR);
+  // ========================================================
+  // 1) HEAT-MAP SPOTLIGHT (larger + more visible at low levels)
+  // ========================================================
+  {
+    const innerR = minDim * 0.05;
+    const outerR = minDim * 0.20 + minDim * 0.55 * smoothL;
+    const aO = Math.min(op * 0.85, (smoothL * 0.65 + 0.05) * op);
+    const aI = Math.min(op,        (smoothL * 0.90 + 0.08) * op);
+
+    const grad = g.createRadialGradient(cx, cy, innerR * 0.2, cx, cy, outerR);
     switch (snd.colorScheme) {
       case 'gray':
-        grad.addColorStop(0,    `rgba(255,255,255,${aI})`);
-        grad.addColorStop(0.4,  `rgba(160,160,160,${aO * 0.6})`);
-        grad.addColorStop(1,    `rgba(60,60,60,0)`);
+        grad.addColorStop(0,   `rgba(255,255,255,${aI})`);
+        grad.addColorStop(0.4, `rgba(160,160,160,${aO * 0.6})`);
+        grad.addColorStop(1,   `rgba(60,60,60,0)`);
         break;
       case 'rainbow':
         grad.addColorStop(0,    `hsla(0,100%,55%,${aI})`);
         grad.addColorStop(0.25, `hsla(30,100%,55%,${aO * 0.7})`);
-        grad.addColorStop(0.5,  `hsla(60,100%,52%,${aO * 0.4})`);
-        grad.addColorStop(0.75, `hsla(120,100%,42%,${aO * 0.18})`);
+        grad.addColorStop(0.5,  `hsla(60,100%,52%,${aO * 0.38})`);
+        grad.addColorStop(0.75, `hsla(120,100%,42%,${aO * 0.16})`);
         grad.addColorStop(1,    `hsla(240,100%,50%,0)`);
         break;
       default: // 'red'
-        grad.addColorStop(0,    `hsla(15,100%,58%,${aI})`);
-        grad.addColorStop(0.25, `hsla(25,100%,55%,${aO * 0.7})`);
-        grad.addColorStop(0.6,  `hsla(40,100%,60%,${aO * 0.28})`);
-        grad.addColorStop(1,    `hsla(50,100%,65%,0)`);
+        grad.addColorStop(0,   `hsla(15,100%,58%,${aI})`);
+        grad.addColorStop(0.3, `hsla(25,100%,55%,${aO * 0.72})`);
+        grad.addColorStop(0.65,`hsla(40,100%,60%,${aO * 0.28})`);
+        grad.addColorStop(1,   `hsla(50,100%,65%,0)`);
     }
     g.fillStyle = grad;
     g.fillRect(0, 0, W, H);
-
-    // Center dot
-    const dotR = Math.max(7, innerR * 0.72);
-    g.beginPath();
-    g.arc(cx, cy, dotR, 0, Math.PI * 2);
-    const dg = g.createRadialGradient(cx, cy, 0, cx, cy, dotR);
-    dg.addColorStop(0, `rgba(255,255,255,${Math.min(0.95, aI + 0.12)})`);
-    dg.addColorStop(1, snd.colorScheme === 'gray'
-      ? `rgba(180,180,180,${aI})` : `rgba(255,90,10,${aI})`);
-    g.fillStyle = dg;
-    g.fill();
-
-    // Pulsing ring
-    g.beginPath();
-    g.arc(cx, cy, innerR + (outerR - innerR) * 0.22, 0, Math.PI * 2);
-    g.strokeStyle = `rgba(255,180,60,${aO * 0.5})`;
-    g.lineWidth = 1.5;
-    g.stroke();
   }
 
-  // ---- Per-mic level bars (bottom-right) ----
+  // ========================================================
+  // 2) TARGET CROSSHAIR at estimated source position
+  // ========================================================
+  if (smoothL > 0.04) {
+    const chR = Math.max(20, minDim * 0.055);
+    const chAlpha = Math.min(0.95, smoothL * 1.1 + 0.1);
+    const chColor = `rgba(255,255,255,${chAlpha})`;
+
+    g.save();
+    g.shadowColor = 'rgba(255,200,50,0.7)';
+    g.shadowBlur = 10;
+    g.strokeStyle = chColor;
+    g.lineWidth = 1.8;
+
+    // Cross lines
+    g.beginPath();
+    g.moveTo(cx - chR, cy); g.lineTo(cx - chR * 0.35, cy);
+    g.moveTo(cx + chR * 0.35, cy); g.lineTo(cx + chR, cy);
+    g.moveTo(cx, cy - chR); g.lineTo(cx, cy - chR * 0.35);
+    g.moveTo(cx, cy + chR * 0.35); g.lineTo(cx, cy + chR);
+    g.stroke();
+
+    // Outer circle
+    g.beginPath();
+    g.arc(cx, cy, chR, 0, Math.PI * 2);
+    g.strokeStyle = `rgba(255,230,80,${chAlpha * 0.75})`;
+    g.lineWidth = 1.5;
+    g.stroke();
+
+    // Inner dot
+    g.beginPath();
+    g.arc(cx, cy, 4, 0, Math.PI * 2);
+    g.fillStyle = `rgba(255,255,255,${chAlpha})`;
+    g.fill();
+
+    g.restore();
+  }
+
+  // ========================================================
+  // 3) DIRECTIONAL GUIDANCE ARROW (screen center → source)
+  // ========================================================
+  {
+    const scX = W / 2, scY = H / 2;
+    const dx = cx - scX, dy = cy - scY;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    const minDist = minDim * 0.08; // don't draw arrow if source ≈ center
+
+    if (dist > minDist && smoothL > 0.04) {
+      const angle = Math.atan2(dy, dx);
+      const bodyStart = minDim * 0.05;
+      const bodyEnd   = Math.min(dist * 0.72, minDim * 0.30);
+      const startX = scX + Math.cos(angle) * bodyStart;
+      const startY = scY + Math.sin(angle) * bodyStart;
+      const endX   = scX + Math.cos(angle) * bodyEnd;
+      const endY   = scY + Math.sin(angle) * bodyEnd;
+
+      const arrowAlpha = Math.min(0.98, smoothL * 1.3 + 0.12);
+
+      g.save();
+      g.shadowColor = 'rgba(255,220,0,0.8)';
+      g.shadowBlur = 14;
+      g.lineCap = 'round';
+
+      // Body
+      g.strokeStyle = `rgba(255,230,0,${arrowAlpha})`;
+      g.lineWidth = 3.5;
+      g.beginPath();
+      g.moveTo(startX, startY);
+      g.lineTo(endX, endY);
+      g.stroke();
+
+      // Arrowhead
+      const hLen = Math.max(14, minDim * 0.04);
+      const hAng = Math.PI / 5.5;
+      g.fillStyle = `rgba(255,230,0,${arrowAlpha})`;
+      g.beginPath();
+      g.moveTo(endX, endY);
+      g.lineTo(endX - hLen * Math.cos(angle - hAng), endY - hLen * Math.sin(angle - hAng));
+      g.lineTo(endX - hLen * Math.cos(angle + hAng), endY - hLen * Math.sin(angle + hAng));
+      g.closePath();
+      g.fill();
+
+      // Pulsing "tail" circle at origin
+      const pulse = 0.55 + 0.45 * Math.sin(Date.now() / 280);
+      g.beginPath();
+      g.arc(scX, scY, minDim * 0.025 * pulse, 0, Math.PI * 2);
+      g.fillStyle = `rgba(255,200,0,${arrowAlpha * 0.55 * pulse})`;
+      g.fill();
+
+      g.restore();
+    }
+  }
+
+  // ========================================================
+  // 4) EDGE INDICATORS when source is near screen border
+  // ========================================================
+  if (smoothL > 0.08) {
+    const pulse = 0.5 + 0.5 * Math.sin(Date.now() / 200);
+    const edgeAlpha = Math.min(0.95, (smoothL * 0.9 + 0.1) * pulse);
+    const tri = 18; // triangle half-width / height
+
+    g.save();
+    g.shadowBlur = 12;
+    g.shadowColor = 'rgba(255,80,0,0.7)';
+    g.fillStyle = `rgba(255,80,0,${edgeAlpha})`;
+
+    if (snd.sy < 0.15) {
+      // Source near top → triangle on top edge pointing down
+      const ex = Math.max(tri + 4, Math.min(W - tri - 4, cx));
+      g.beginPath(); g.moveTo(ex - tri, 4); g.lineTo(ex + tri, 4); g.lineTo(ex, tri + 4); g.closePath(); g.fill();
+    }
+    if (snd.sy > 0.85) {
+      const ex = Math.max(tri + 4, Math.min(W - tri - 4, cx));
+      g.beginPath(); g.moveTo(ex - tri, H - 4); g.lineTo(ex + tri, H - 4); g.lineTo(ex, H - tri - 4); g.closePath(); g.fill();
+    }
+    if (snd.sx < 0.12) {
+      const ey = Math.max(tri + 4, Math.min(H - tri - 4, cy));
+      g.beginPath(); g.moveTo(4, ey - tri); g.lineTo(4, ey + tri); g.lineTo(tri + 4, ey); g.closePath(); g.fill();
+    }
+    if (snd.sx > 0.88) {
+      const ey = Math.max(tri + 4, Math.min(H - tri - 4, cy));
+      g.beginPath(); g.moveTo(W - 4, ey - tri); g.lineTo(W - 4, ey + tri); g.lineTo(W - tri - 4, ey); g.closePath(); g.fill();
+    }
+    g.restore();
+  }
+
+  // ========================================================
+  // 5) PER-MIC LEVEL BARS (bottom-right)
+  // ========================================================
   const bW = 52, bH = 5, gap = 7;
   const bX = W - bW - 14, bY0 = H - 14 - mics.length * (bH + gap);
   mics.forEach((m, i) => {
@@ -1058,7 +1177,7 @@ function sndRender() {
     g.beginPath();
     if (g.roundRect) g.roundRect(bx, by, bW, bH, 2); else g.rect(bx, by, bW, bH);
     g.fill();
-    const lv = Math.min(1, rmsRaw[i] * 28);
+    const lv = Math.min(1, rmsRaw[i] * 32);
     if (lv > 0) {
       g.fillStyle = `hsla(${lv > 0.72 ? 0 : lv > 0.38 ? 32 : 115},100%,58%,0.9)`;
       g.beginPath();
@@ -1073,11 +1192,9 @@ function sndRender() {
     g.textAlign = 'left';
   });
 
-  // Update frequency graph and dB overlay.
   sndDrawFreq();
   if (snd.showDb && isFinite(snd.peakDb)) {
-    const dbEl = $('sound-db-display');
-    dbEl.textContent = snd.peakDb.toFixed(1) + ' dB';
+    $('sound-db-display').textContent = snd.peakDb.toFixed(1) + ' dB';
   }
 
   snd.raf = requestAnimationFrame(sndRender);
