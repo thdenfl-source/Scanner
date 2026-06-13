@@ -806,6 +806,14 @@ const snd = {
   freqHi: 8000,           // Hz — high cut of selected band
   peakDb: -Infinity,
   freqDrag: null,         // pointer drag state for freq graph
+  // Stereo L/R channel split for horizontal direction
+  stereo: null,
+  hasStereo: false,
+  // DeviceOrientation gradient tracking for direction when moving camera
+  orientTgt: { x: 0.5, y: 0.5 },
+  orientLast: null,
+  orientLevelLast: 0,
+  orientHandler: null,
 };
 
 async function sndStart() {
@@ -820,6 +828,75 @@ async function sndStart() {
 
     snd.ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
     snd.mics = [];
+    snd.stereo = null; snd.hasStereo = false;
+    snd.orientTgt = { x: 0.5, y: 0.5 };
+    snd.orientLast = null; snd.orientLevelLast = 0;
+
+    // ── Stereo L/R channel split ────────────────────────────────────────
+    // Request a stereo stream and split into left/right AnalyserNodes so
+    // we can compute the inter-channel dB balance as a horizontal direction
+    // cue. This works even with a single physical "default" mic entry, as
+    // long as the device exposes a 2-channel stream (most modern phones do).
+    try {
+      const ss = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: { ideal: 2 }, echoCancellation: false,
+                 noiseSuppression: false, autoGainControl: false },
+        video: false,
+      });
+      const nCh = (ss.getAudioTracks()[0].getSettings().channelCount) || 1;
+      const sSrc = snd.ctx.createMediaStreamSource(ss);
+      if (nCh >= 2) {
+        const splitter = snd.ctx.createChannelSplitter(2);
+        sSrc.connect(splitter);
+        const mkAn = () => {
+          const a = snd.ctx.createAnalyser();
+          a.fftSize = 2048; a.smoothingTimeConstant = 0; return a;
+        };
+        const anL = mkAn(), anR = mkAn();
+        splitter.connect(anL, 0, 0);
+        splitter.connect(anR, 1, 0);
+        snd.stereo = {
+          stream: ss, src: sSrc, splitter, anL, anR,
+          fBufL: new Float32Array(anL.frequencyBinCount),
+          fBufR: new Float32Array(anR.frequencyBinCount),
+        };
+        snd.hasStereo = true;
+      } else {
+        ss.getTracks().forEach(t => t.stop());
+      }
+    } catch (_) { /* stereo unavailable — fall back to mono direction */ }
+
+    // ── DeviceOrientation gradient tracker ─────────────────────────────
+    // When the user pans the camera, we correlate orientation-change direction
+    // with amplitude change: if sound gets louder while panning right → source
+    // is to the right. Works with ANY number of microphones including 1 mono.
+    snd.orientHandler = (e) => {
+      if (!snd.active || snd.sl < 0.05) return;
+      const cur = { a: e.alpha || 0, b: e.beta || 0 };
+      if (!snd.orientLast) { snd.orientLast = cur; snd.orientLevelLast = snd.sl; return; }
+      const dA = ((cur.a - snd.orientLast.a + 540) % 360) - 180; // yaw (L/R pan)
+      const dB = cur.b - snd.orientLast.b;                        // pitch (up/down tilt)
+      const dL = snd.sl - snd.orientLevelLast;
+      const k = 0.007;
+      if (Math.abs(dL) > 0.008 && (Math.abs(dA) > 0.3 || Math.abs(dB) > 0.3)) {
+        const sign = dL > 0 ? 1 : -1; // louder = moving toward source
+        // dA > 0 = phone turned right  → source on right  → tgtX increases
+        // dB > 0 = phone tilted down   → source below     → tgtY increases
+        snd.orientTgt.x = Math.max(0.05, Math.min(0.95, snd.orientTgt.x + sign * dA * k));
+        snd.orientTgt.y = Math.max(0.05, Math.min(0.95, snd.orientTgt.y + sign * dB * k));
+      }
+      snd.orientLast = cur;
+      snd.orientLevelLast = snd.sl;
+    };
+    // iOS 13+ requires explicit permission for DeviceOrientationEvent.
+    if (typeof DeviceOrientationEvent !== 'undefined' &&
+        typeof DeviceOrientationEvent.requestPermission === 'function') {
+      DeviceOrientationEvent.requestPermission()
+        .then(r => { if (r === 'granted') window.addEventListener('deviceorientation', snd.orientHandler); })
+        .catch(() => {});
+    } else {
+      window.addEventListener('deviceorientation', snd.orientHandler);
+    }
 
     for (const dev of micDevs) {
       try {
@@ -881,6 +958,15 @@ function sndStop() {
     try { m.stream.getTracks().forEach(t => t.stop()); } catch (_) {}
   });
   snd.mics = [];
+  if (snd.stereo) {
+    try { snd.stereo.src.disconnect(); } catch (_) {}
+    try { snd.stereo.stream.getTracks().forEach(t => t.stop()); } catch (_) {}
+    snd.stereo = null; snd.hasStereo = false;
+  }
+  if (snd.orientHandler) {
+    window.removeEventListener('deviceorientation', snd.orientHandler);
+    snd.orientHandler = null; snd.orientLast = null;
+  }
   if (snd.ctx) { snd.ctx.close().catch(() => {}); snd.ctx = null; }
   if (snd.canvas) {
     snd.g.clearRect(0, 0, snd.canvas.width, snd.canvas.height);
@@ -977,28 +1063,78 @@ function sndRender() {
   snd.sl += 0.20 * (rawL - snd.sl);
   const smoothL = snd.sl;
 
-  // ---- Direction estimation (dB difference primary, TDOA refinement) ----
+  // ================================================================
+  // Direction estimation — three independent sources, blended:
+  //
+  //  A) Stereo L/R channel balance  → horizontal (X axis)
+  //     Works stationary; most reliable on phones with true stereo.
+  //
+  //  B) Separate-mic dB difference  → vertical (Y axis, or X if ≥3 mics)
+  //     Uses individually enumerated audio-input devices.
+  //
+  //  C) DeviceOrientation gradient  → both axes
+  //     User pans the camera; amplitude change correlates with direction.
+  //     Works with even a single mono mic — user must sweep the camera.
+  // ================================================================
   let tgtX = 0.5, tgtY = 0.5;
-  if (mics.length >= 2) {
-    // dB level difference between mic pair is the most robust direction cue.
-    // ±12 dB difference = full deflection (±0.45 from center).
-    const dbDiff01 = bandPeakDb[0] - bandPeakDb[1];
-    tgtY = 0.5 - Math.max(-0.45, Math.min(0.45, dbDiff01 / 24));
+  let hasX = false, hasY = false;
 
-    // Refine with TDOA cross-correlation when signal is audible.
-    if (rawL > 0.15) {
-      const maxD = Math.ceil(0.20 / 343 * sr);
-      const lag01 = sndNCC(mics[0].buf, mics[1].buf, maxD);
-      const sinV = Math.min(1, Math.max(-1, (lag01 / sr) * 343 / 0.15));
-      tgtY = tgtY * 0.55 + (0.5 - sinV * 0.45) * 0.45;
+  // ── A) Stereo L/R ──────────────────────────────────────────────────
+  if (snd.hasStereo && snd.stereo) {
+    const { anL, anR, fBufL, fBufR } = snd.stereo;
+    anL.getFloatFrequencyData(fBufL);
+    anR.getFloatFrequencyData(fBufR);
+    let pkL = -150, pkR = -150;
+    const fbins = fBufL.length;
+    const bLo2 = Math.max(0, Math.floor(snd.freqLo / (sr / 2) * fbins));
+    const bHi2 = Math.min(fbins - 1, Math.ceil(snd.freqHi / (sr / 2) * fbins));
+    for (let b = bLo2; b <= bHi2; b++) {
+      if (fBufL[b] > pkL) pkL = fBufL[b];
+      if (fBufR[b] > pkR) pkR = fBufR[b];
     }
-
-    if (mics.length >= 3) {
-      const dbDiff12 = bandPeakDb[1] - bandPeakDb[2];
-      tgtX = 0.5 + Math.max(-0.45, Math.min(0.45, dbDiff12 / 24));
+    const diffLR = pkL - pkR; // +ve = L louder = source on LEFT → tgtX < 0.5
+    if (isFinite(diffLR) && Math.abs(diffLR) > 0.5) {
+      tgtX = 0.5 - Math.max(-0.45, Math.min(0.45, diffLR / 18));
+      hasX = true;
     }
   }
 
+  // ── B) Separate mic comparison ──────────────────────────────────────
+  if (mics.length >= 2) {
+    const dbDiff01 = bandPeakDb[0] - bandPeakDb[1];
+    if (isFinite(dbDiff01) && Math.abs(dbDiff01) > 0.5) {
+      // Assume mic[0]=top, mic[1]=bottom → Y direction.
+      tgtY = 0.5 - Math.max(-0.45, Math.min(0.45, dbDiff01 / 22));
+      hasY = true;
+    }
+    // TDOA refinement for Y.
+    if (rawL > 0.12) {
+      const maxD = Math.ceil(0.20 / 343 * sr);
+      const lag01 = sndNCC(mics[0].buf, mics[1].buf, maxD);
+      const sinV = Math.min(1, Math.max(-1, (lag01 / sr) * 343 / 0.15));
+      tgtY = (tgtY * 0.55) + ((0.5 - sinV * 0.45) * 0.45);
+      hasY = true;
+    }
+    if (mics.length >= 3 && !hasX) {
+      const dbDiff12 = bandPeakDb[1] - bandPeakDb[2];
+      if (isFinite(dbDiff12) && Math.abs(dbDiff12) > 0.5) {
+        tgtX = 0.5 + Math.max(-0.45, Math.min(0.45, dbDiff12 / 22));
+        hasX = true;
+      }
+    }
+  }
+
+  // ── C) DeviceOrientation gradient (always active as refinement) ──────
+  // Orientation estimate has its own smoothed target; blend in by weight.
+  // When orientation gives the only signal (hasX/hasY false), it dominates.
+  {
+    const oBlendX = hasX ? 0.20 : 0.60;
+    const oBlendY = hasY ? 0.20 : 0.60;
+    tgtX = tgtX * (1 - oBlendX) + snd.orientTgt.x * oBlendX;
+    tgtY = tgtY * (1 - oBlendY) + snd.orientTgt.y * oBlendY;
+  }
+
+  // Exponential smoothing on the final target position.
   const alpha = 0.14;
   snd.sx += alpha * (tgtX - snd.sx);
   snd.sy += alpha * (tgtY - snd.sy);
