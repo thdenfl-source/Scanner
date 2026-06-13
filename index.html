@@ -34,9 +34,14 @@
 
   /* Top bar */
   .topbar {
-    height: 56px; flex-shrink: 0;
+    flex-shrink: 0;
     display: flex; align-items: center; justify-content: space-between;
-    padding: 0 12px;
+    /* Push content below the notch / Dynamic Island / status bar */
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-left: max(12px, env(safe-area-inset-left, 0px));
+    padding-right: max(12px, env(safe-area-inset-right, 0px));
+    padding-bottom: 0;
+    min-height: calc(56px + env(safe-area-inset-top, 0px));
     background: rgba(10,10,10,0.85);
     z-index: 10;
   }
@@ -63,10 +68,14 @@
     position: absolute; inset: 0; pointer-events: none;
   }
   .cam-bottom {
-    height: 130px; flex-shrink: 0;
+    flex-shrink: 0;
     background: #0a0a0a;
     display: flex; align-items: center; justify-content: space-around;
-    padding: 0 16px;
+    padding-top: 0;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    min-height: calc(130px + env(safe-area-inset-bottom, 0px));
     position: relative;
   }
   .shutter {
@@ -209,9 +218,14 @@
   }
   .crop-line { stroke: #4ea1ff; stroke-width: 2; fill: rgba(78,161,255,0.12); }
   .crop-bottom {
-    height: 96px; flex-shrink: 0;
+    flex-shrink: 0;
     display: flex; align-items: center; justify-content: space-around;
-    background: #0a0a0a; padding: 0 12px;
+    background: #0a0a0a;
+    padding-top: 0;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    padding-left: max(12px, env(safe-area-inset-left, 0px));
+    padding-right: max(12px, env(safe-area-inset-right, 0px));
+    min-height: calc(96px + env(safe-area-inset-bottom, 0px));
   }
   .crop-bottom button {
     background: #1a1a1a; color: #fff; border: 1px solid #333;
